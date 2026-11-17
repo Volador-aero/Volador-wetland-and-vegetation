@@ -14,7 +14,7 @@ export default function AnalysisPage({
   analysisMode,
   onAnalysisModeChange,
 }: AnalysisPageProps) {
-  const { project, validation, runStatus, triggerRun } = useProject();
+  const { project, validation, runStatus, triggerRun, retryActiveRun } = useProject();
 
   const [config, setConfig] = useState({
     observationDatesEnabled: true,
@@ -68,7 +68,7 @@ export default function AnalysisPage({
   };
 
   const isRunning =
-    runStatus && !["COMPLETED", "FAILED"].includes(runStatus.status);
+    runStatus && !["COMPLETED", "FAILED", "INTERRUPTED"].includes(runStatus.status);
 
   const isDatasetValid = Boolean(
     project?.datasets_ready || validation?.valid
@@ -152,6 +152,19 @@ export default function AnalysisPage({
         {runStatus?.error && (
           <div className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
             Execution Failure: {runStatus.error}
+          </div>
+        )}
+
+        {runStatus?.status === "INTERRUPTED" && (
+          <div className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
+            <div>{runStatus.message || "The backend stopped before analysis completed."}</div>
+            <button
+              type="button"
+              onClick={retryActiveRun}
+              className="mt-2 rounded bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
+            >
+              Retry Analysis
+            </button>
           </div>
         )}
       </section>

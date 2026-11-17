@@ -111,3 +111,12 @@ def get_run_status(run_id: str):
     if not run_info:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     return run_info
+
+
+@router.post("/{run_id}/retry", response_model=RunStatusResponse, status_code=status.HTTP_202_ACCEPTED)
+def retry_run(run_id: str):
+    """Start a new run while preserving the original failed/interrupted run."""
+    try:
+        return RunWorker.retry_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

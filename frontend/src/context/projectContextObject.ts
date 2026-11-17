@@ -40,6 +40,7 @@ export interface ProjectContextType {
     mode?: "vegetation" | "wetland"
   ) => Promise<void>;
   triggerRun: (config?: Record<string, any>) => Promise<void>;
+  retryActiveRun: () => Promise<void>;
   refreshResults: () => Promise<void>;
   fetchPreparation: (projectId?: string) => Promise<PreparationState | undefined>;
   saveDraft: (inclusion: Record<string, any> | null, exclusions: ManualExclusion[]) => Promise<void>;
