@@ -157,7 +157,7 @@ class RunCreateRequest(BaseModel):
 class RunStatusResponse(BaseModel):
     run_id: str
     project_id: str
-    status: str  # QUEUED, VALIDATING, ALIGNING, PREPROCESSING, INFERENCE, CHANGE_ANALYSIS, HYDROLOGY, METRICS, VALIDATION, REPORTING, COMPLETED, FAILED
+    status: str  # QUEUED, VALIDATING, ALIGNING, PREPROCESSING, INFERENCE, CHANGE_ANALYSIS, HYDROLOGY, METRICS, VALIDATION, REPORTING, COMPLETED, FAILED, INTERRUPTED
     progress: int = 0  # 0 to 100
     current_step: str = ""
     created_at: str

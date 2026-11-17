@@ -3,7 +3,7 @@
  * TypeScript API client for communicating with the FastAPI backend server.
  */
 
-const API_BASE = "http://127.0.0.1:8000/api";
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000/api";
 
 export interface Project {
   id: string;
@@ -93,7 +93,8 @@ export interface RunStatus {
     | "VALIDATION"
     | "REPORTING"
     | "COMPLETED"
-    | "FAILED";
+    | "FAILED"
+    | "INTERRUPTED";
   progress: number;
   current_step: string;
   created_at: string;
@@ -402,6 +403,14 @@ export async function launchRun(projectId: string, config?: Record<string, any>)
 export async function getRunStatus(runId: string): Promise<RunStatus> {
   const res = await fetch(`${API_BASE}/runs/${runId}`);
   if (!res.ok) await handleResponseError(res, "Failed to fetch run status");
+  return res.json();
+}
+
+export async function retryRun(runId: string): Promise<RunStatus> {
+  const res = await fetch(`${API_BASE}/runs/${runId}/retry`, {
+    method: "POST",
+  });
+  if (!res.ok) await handleResponseError(res, "Failed to retry analysis run");
   return res.json();
 }
 

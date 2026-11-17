@@ -14,6 +14,7 @@ import {
   uploadBandFile,
   launchRun,
   getRunStatus,
+  retryRun,
   getRunResults,
   getRunLayers,
   resetProject,
@@ -149,7 +150,7 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
 
   // Poll run status when active run is running.
   useEffect(() => {
-    if (!runStatus || ["COMPLETED", "FAILED"].includes(runStatus.status)) {
+    if (!runStatus || ["COMPLETED", "FAILED", "INTERRUPTED"].includes(runStatus.status)) {
       return;
     }
 
@@ -401,6 +402,23 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   };
 
+  const retryActiveRun = async () => {
+    if (!runStatus?.run_id) return;
+
+    try {
+      setLoading(true);
+      setError(null);
+      setResults(null);
+      setLayers([]);
+      setActiveLayerId("");
+      setRunStatus(await retryRun(runStatus.run_id));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Unable to retry run");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const refreshResults = async () => {
     if (runStatus?.run_id) {
       await loadRunData(runStatus.run_id);
@@ -426,6 +444,7 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
         triggerValidation,
         uploadBand,
         triggerRun,
+        retryActiveRun,
         refreshResults,
         updateManualExclusion,
         addManualExclusion,

@@ -73,9 +73,39 @@ python -m pytest backend/tests/test_fastapi_server.py
 python -m pytest backend/tests/test_e2e_full_integration.py
 ```
 
+### 4. Durable Run-State Recovery Tests
+
+The focused tests use Python's built-in `unittest` runner. From the project
+root, run:
+
+```bash
+python -m unittest discover -s backend/tests -p "test_durable_run_state.py" -v
+```
+
+They use temporary directories and do not modify `backend/storage`. See
+[`durable-run_state_readme.md`](durable-run_state_readme.md) for the full setup,
+implementation plan and time-complexity analysis.
+
 ---
 
-## 4. Scientific Principles
+## 4. Durable Run-State Recovery Setup
+
+No database or additional service is required. New runs create a small
+`run_state.json` in their run folder and a direct pointer under
+`backend/storage/run_index`. After a restart, unfinished work is reported as
+`INTERRUPTED` with its last confirmed step.
+
+Useful endpoints:
+
+```text
+POST /api/runs
+GET  /api/runs/<run_id>
+POST /api/runs/<run_id>/retry
+```
+
+---
+
+## 5. Scientific Principles
 
 - **5-Channel Model Input**: Channels `0=NDVI`, `1=GNDVI`, `2=NDRE`, `3=NIR`, `4=RedEdge`.
 - **4 Vegetation Classes**: `0=Background`, `1=Severe Stress`, `2=Moderate Stress`, `3=Healthy Vegetation`.
