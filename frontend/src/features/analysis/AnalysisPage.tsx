@@ -14,7 +14,7 @@ export default function AnalysisPage({
   analysisMode,
   onAnalysisModeChange,
 }: AnalysisPageProps) {
-  const { project, validation, runStatus, triggerRun } = useProject();
+  const { project, validation, runStatus, triggerRun, error } = useProject();
 
   const [config, setConfig] = useState({
     observationDatesEnabled: true,
@@ -152,6 +152,15 @@ export default function AnalysisPage({
         {runStatus?.error && (
           <div className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
             Execution Failure: {runStatus.error}
+          </div>
+        )}
+
+        {error && !runStatus && (
+          <div
+            role="alert"
+            className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400"
+          >
+            {error}
           </div>
         )}
       </section>

@@ -79,6 +79,9 @@ def create_wetland_onnx_model(output_path: Path):
 
     # Model
     model = helper.make_model(graph, producer_name="gis_wetland_engine")
+    # Keep the generated artifact compatible with the ONNX Runtime version
+    # used by the application. The current onnx package defaults to IR 14.
+    model.ir_version = 13
     model.opset_import[0].version = 13
 
     onnx.checker.check_model(model)
