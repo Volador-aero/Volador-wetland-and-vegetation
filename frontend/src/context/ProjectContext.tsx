@@ -12,6 +12,7 @@ import {
   createProject,
   validateDatasets,
   uploadBandFile,
+  updateProjectDates,
   launchRun,
   getRunStatus,
   getRunResults,
@@ -199,6 +200,13 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
     } finally {
       setLoading(false);
     }
+  };
+
+  const updateDates = async (t1Date: string, t2Date: string) => {
+    if (!project) return;
+
+    const updatedProject = await updateProjectDates(project.id, t1Date, t2Date);
+    setProject(updatedProject);
   };
 
   const uploadBand = async (
@@ -424,6 +432,7 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
 
         setActiveLayerId,
         triggerValidation,
+        updateDates,
         uploadBand,
         triggerRun,
         refreshResults,

@@ -32,6 +32,15 @@ def launch_run(payload: RunCreateRequest):
         effective_mode = project["analysis_mode"].strip().lower()
 
     is_veg = (effective_mode == "vegetation")
+    config_dict = payload.config.dict() if payload.config else None
+
+    try:
+        RunWorker.preflight_run(payload.project_id, config_dict)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc)
+        ) from exc
 
     user_has_t1 = t1_dir.exists() and bool(list(t1_dir.glob("*.tif")) or list(t1_dir.glob("*.TIF")))
     user_has_t2 = t2_dir.exists() and bool(list(t2_dir.glob("*.tif")) or list(t2_dir.glob("*.TIF")))
@@ -94,7 +103,6 @@ def launch_run(payload: RunCreateRequest):
         "[GIS DEBUG] backend config dict:",
         payload.config.dict() if payload.config else None,
     )
-    config_dict = payload.config.dict() if payload.config else None
     try:
         run_info = RunWorker.start_run(payload.project_id, config_dict)
     except ValueError as exc:

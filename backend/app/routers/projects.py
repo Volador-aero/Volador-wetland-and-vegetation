@@ -70,6 +70,11 @@ def update_project_dates(project_id: str, payload: ProjectDatesUpdate):
             status_code=400,
             detail="T1 date must not be later than T2 date."
         )
+    if t1 == t2:
+        raise HTTPException(
+            status_code=400,
+            detail="T1 and T2 observation dates must be different."
+        )
 
     ProjectStore.update_project(project_id, {
         "t1_date": payload.t1_date,

@@ -31,6 +31,8 @@ from gis_engine.api.service import analyze_wetland
 from gis_engine.ingestion.loader import RasterLoader
 from gis_engine.ingestion.validator import InputValidator
 from gis_engine.alignment.spatial import ReferenceGrid
+from gis_engine.core.config import load_config
+from gis_engine.inference.onnx import ONNXModelWrapper
 from gis_engine.wetland.exclusion import build_inclusion_mask, build_manual_exclusion_mask
 
 logger = logging.getLogger(__name__)
@@ -560,6 +562,229 @@ class RunWorker:
     """Manages background async execution of the GIS engine pipeline."""
 
     @classmethod
+    def preflight_run(
+        cls,
+        project_id: str,
+        config_overrides: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Validate run prerequisites without creating or persisting run state."""
+        project = ProjectStore.get_project(project_id)
+        if not project:
+            raise ValueError(f"Project {project_id} not found")
+
+        prep = ProjectStore.load_preparation(project_id)
+        if prep and (
+            prep.get("status") != "COMMITTED"
+            or not prep.get("is_locked", False)
+        ):
+            raise ValueError(
+                "Analysis cannot be started: Preparation area has not been "
+                "confirmed and locked. Please finalize the analysis area in "
+                "the Prepare Area stage."
+            )
+
+        overrides = config_overrides or {}
+        effective_mode = str(
+            overrides.get("analysis_mode")
+            or overrides.get("analysisMode")
+            or project.get("analysis_mode")
+            or "wetland"
+        ).strip().lower()
+        if effective_mode not in {"vegetation", "wetland"}:
+            raise ValueError(
+                f"Analysis cannot start: Unsupported analysis mode "
+                f"'{effective_mode}'. Use 'vegetation' or 'wetland'."
+            )
+        is_vegetation_mode = effective_mode == "vegetation"
+
+        config_path = ENGINE_SRC.parent / "configs" / "config.json"
+        try:
+            config = load_config(config_path)
+        except Exception as exc:
+            raise ValueError(
+                f"Analysis cannot start: Invalid analysis configuration. {exc}"
+            ) from exc
+
+        model_config = config["model"]
+        if model_config.get("in_channels") != 5:
+            raise ValueError(
+                "Analysis cannot start: Configuration model.in_channels "
+                "must be 5."
+            )
+        if model_config.get("num_classes") != 4:
+            raise ValueError(
+                "Analysis cannot start: Configuration model.num_classes "
+                "must be 4."
+            )
+        if model_config.get("channel_order") != [
+            "ndvi",
+            "gndvi",
+            "ndre",
+            "nir",
+            "rededge",
+        ]:
+            raise ValueError(
+                "Analysis cannot start: Configuration model.channel_order "
+                "must define ndvi, gndvi, ndre, nir, rededge."
+            )
+
+        model_path = Path(model_config["path"])
+        if not model_path.is_absolute():
+            model_path = ENGINE_SRC.parent / model_path
+        display_model_path = Path(model_config["path"])
+        if display_model_path.is_absolute():
+            try:
+                display_model_path = display_model_path.relative_to(ENGINE_SRC.parent)
+            except ValueError:
+                display_model_path = Path(display_model_path.name)
+        display_model_path = display_model_path.as_posix()
+        if not model_path.is_file():
+            logger.error("Preflight model file is missing: %s", display_model_path)
+            raise ValueError(
+                "Analysis cannot start because the analysis model is missing. "
+                "Please contact the administrator to restore the model."
+            )
+
+        try:
+            model = ONNXModelWrapper(str(model_path))
+            if model.session is None:
+                raise RuntimeError("ONNX Runtime session was not created")
+            input_shape = model.session.get_inputs()[0].shape
+            output_shape = model.session.get_outputs()[0].shape
+        except Exception as exc:
+            error_detail = str(exc).replace(str(model_path), display_model_path)
+            logger.error(
+                "Preflight model could not be loaded (%s): %s",
+                display_model_path,
+                error_detail,
+            )
+            raise ValueError(
+                "Analysis cannot start because the analysis model is not "
+                "compatible with this application. Please contact the "
+                "administrator to install the approved model."
+            ) from exc
+
+        if len(input_shape) < 2 or input_shape[1] != 5:
+            actual_channels = input_shape[1] if len(input_shape) > 1 else "unknown"
+            logger.error(
+                "Preflight model has invalid input channels (%s): %s",
+                display_model_path,
+                actual_channels,
+            )
+            raise ValueError(
+                "Analysis cannot start because the analysis model is "
+                "incompatible with this application. Please contact the "
+                "administrator to install the approved model."
+            )
+        if len(output_shape) < 2 or output_shape[1] != 4:
+            actual_classes = output_shape[1] if len(output_shape) > 1 else "unknown"
+            logger.error(
+                "Preflight model has invalid output classes (%s): %s",
+                display_model_path,
+                actual_classes,
+            )
+            raise ValueError(
+                "Analysis cannot start because the analysis model is "
+                "incompatible with this application. Please contact the "
+                "administrator to install the approved model."
+            )
+
+        t1_dir = Path(project["t1_dir"])
+        t2_dir = Path(project["t2_dir"])
+        sample_dir = ENGINE_SRC.parent / "data" / "sample_scene"
+        user_has_t1 = t1_dir.exists() and bool(
+            list(t1_dir.glob("*.tif")) or list(t1_dir.glob("*.TIF"))
+        )
+        user_has_t2 = t2_dir.exists() and bool(
+            list(t2_dir.glob("*.tif")) or list(t2_dir.glob("*.TIF"))
+        )
+
+        if is_vegetation_mode:
+            if not user_has_t1:
+                if not sample_dir.exists():
+                    raise ValueError(
+                        f"Analysis cannot start: No dataset files found in "
+                        f"{t1_dir} and no sample scene is available."
+                    )
+                t1_dir = sample_dir / "t1"
+        elif not (user_has_t1 and user_has_t2):
+            if not sample_dir.exists():
+                raise ValueError(
+                    "Analysis cannot start: Required T1/T2 dataset files "
+                    f"were not found in {t1_dir} and {t2_dir}, and no "
+                    "sample scene is available."
+                )
+            t1_dir = sample_dir / "t1"
+            t2_dir = sample_dir / "t2"
+
+        band_mapping = {
+            "green": ["*_G.tif", "*_G.TIF", "*green.tif"],
+            "red": ["*_R.tif", "*_R.TIF", "*red.tif"],
+            "rededge": ["*_RE.tif", "*_RE.TIF", "*rededge.tif"],
+            "nir": ["*_NIR.tif", "*_NIR.TIF", "*nir.tif"],
+        }
+        validation = DatasetService.inspect_and_validate(
+            t1_dir=t1_dir,
+            t2_dir=None if is_vegetation_mode else t2_dir,
+            band_mapping=band_mapping,
+            analysis_mode=effective_mode,
+            wetland_boundary=project.get("wetland_boundary"),
+        )
+        if not validation["valid"]:
+            messages = "; ".join(validation.get("messages", []))
+            raise ValueError(
+                f"Analysis cannot start: Dataset validation failed. {messages}"
+            )
+
+        use_observation_dates = overrides.get("use_observation_dates", True)
+        t1_date = (
+            overrides.get("t1_date")
+            or project.get("t1_date")
+            or _extract_date_from_directory(t1_dir)
+        )
+        t2_date = (
+            overrides.get("t2_date")
+            or project.get("t2_date")
+            or _extract_date_from_directory(t2_dir)
+        )
+        if not user_has_t1 and is_vegetation_mode:
+            t1_date = t1_date or "2023-08-14"
+        if not (user_has_t1 and user_has_t2) and not is_vegetation_mode:
+            t1_date = t1_date or "2023-08-14"
+            t2_date = t2_date or "2023-08-28"
+
+        if use_observation_dates and not is_vegetation_mode:
+            if not t1_date or not t2_date:
+                raise ValueError(
+                    "Analysis cannot start: Observation dates are required "
+                    "for wetland analysis and could not be determined for "
+                    "both T1 and T2."
+                )
+            try:
+                parsed_t1 = datetime.strptime(t1_date, "%Y-%m-%d")
+                parsed_t2 = datetime.strptime(t2_date, "%Y-%m-%d")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Analysis cannot start: Observation dates must use "
+                    "YYYY-MM-DD format."
+                ) from exc
+            if parsed_t1 == parsed_t2:
+                raise ValueError(
+                    "Analysis cannot start: T1 and T2 observation dates "
+                    "must be different."
+                )
+        elif use_observation_dates:
+            for label, date_value in (("T1", t1_date), ("T2", t2_date)):
+                if date_value:
+                    try:
+                        datetime.strptime(date_value, "%Y-%m-%d")
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"Analysis cannot start: {label} observation "
+                            "date must use YYYY-MM-DD format."
+                        ) from exc
+
+    @classmethod
     def start_run(cls, project_id: str, config_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         project = ProjectStore.get_project(project_id)
         if not project:
@@ -624,9 +849,11 @@ class RunWorker:
 
         try:
             config_path = ENGINE_SRC.parent / "configs" / "config.json"
-            model_path = ENGINE_SRC.parent / "models" / "best_finetuned_model.onnx"
-            if not model_path.exists():
-                model_path = config_path
+            with open(config_path, "r", encoding="utf-8") as cf:
+                base_cfg = json.load(cf)
+            model_path = Path(base_cfg["model"]["path"])
+            if not model_path.is_absolute():
+                model_path = ENGINE_SRC.parent / model_path
 
             # If caller supplied custom run configurations, write a runtime config snapshot
             if config_overrides and isinstance(config_overrides, dict):
