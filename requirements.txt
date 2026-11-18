@@ -1,0 +1,21 @@
+# Wetland GIS development environment (verified on Windows Python 3.11).
+# One requirements file for the FastAPI backend, GIS engine and existing tests.
+fastapi==0.162.0
+uvicorn==0.54.0
+pydantic==2.14.3
+numpy==2.4.6
+scipy==1.17.1
+rasterio==1.4.4
+matplotlib==3.11.2
+Pillow==13.0.0
+onnx==1.23.2
+onnxruntime==1.31.1
+reportlab==5.1.0
+pyshp==3.1.9
+python-multipart==0.0.34
+opencv-python-headless==5.1.0.95
+# Used directly by environment.py and the existing backend tests.
+packaging==26.3
+pytest==9.2.0
+httpx==0.28.1
+pypdf==7.1.0
