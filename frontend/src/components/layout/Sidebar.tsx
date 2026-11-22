@@ -1,4 +1,15 @@
+
 import type { ReactNode } from "react";
+import {
+  LayoutDashboard,
+  Database,
+  Layers,
+  BarChart3,
+  Map,
+  CheckCircle,
+  FileText,
+  Bot,
+} from "lucide-react";
 
 type NavigationItem = {
   label: string;
@@ -11,13 +22,14 @@ type SidebarProps = {
 };
 
 const navigationItems: NavigationItem[] = [
-  { label: "Overview", icon: "⌂" },
-  { label: "Datasets", icon: "▣" },
-  { label: "Prepare", icon: "⬡" },
-  { label: "Analysis", icon: "◇" },
-  { label: "Results", icon: "▥" },
-  { label: "Validation", icon: "✓" },
-  { label: "Report", icon: "□" },
+  { label: "Overview", icon: <LayoutDashboard size={18} /> },
+  { label: "Datasets", icon: <Database size={18} /> },
+  { label: "Prepare", icon: <Layers size={18} /> },
+  { label: "Analysis", icon: <BarChart3 size={18} /> },
+  { label: "Results", icon: <Map size={18} /> },
+  { label: "Validation", icon: <CheckCircle size={18} /> },
+  { label: "Report", icon: <FileText size={18} /> },
+  { label: "AI Assistant", icon: <Bot size={18} /> },
 ];
 
 export default function Sidebar({
@@ -59,7 +71,7 @@ export default function Sidebar({
               >
                 <span
                   className={[
-                    "flex h-5 w-5 items-center justify-center text-xs",
+                    "flex h-5 w-5 items-center justify-center",
                     active
                       ? "text-[var(--accent)]"
                       : "text-[var(--text-secondary)]",

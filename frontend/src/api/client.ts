@@ -482,3 +482,47 @@ export function getDatasetPreviewImageUrl(projectId: string, timePoint: string =
   return `${API_BASE}/projects/${projectId}/datasets/preview-image?time_point=${timePoint}`;
 }
 
+
+// ------------------------------------------------------------
+// AETHRA AI Assistant API
+// ------------------------------------------------------------
+
+
+
+
+export interface AssistantChatResponse {
+  answer: string;
+  model: string;
+  status: string;
+}
+
+export interface AssistantChatOptions {
+  projectId?: string;
+  runId?: string;
+}
+
+export async function sendAssistantMessage(
+  question: string,
+  options?: AssistantChatOptions
+): Promise<AssistantChatResponse> {
+  const res = await fetch(`${API_BASE}/assistant/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      question,
+      project_id: options?.projectId,
+      run_id: options?.runId,
+    }),
+  });
+
+  if (!res.ok) {
+    await handleResponseError(
+      res,
+      "Failed to get a response from the AI Assistant."
+    );
+  }
+
+  return res.json();
+}

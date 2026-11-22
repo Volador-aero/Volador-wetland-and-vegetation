@@ -1,0 +1,39 @@
+# Python environments
+.venv/
+.venv_geo/
+.venv312/
+__pycache__/
+*.py[cod]
+
+# Python testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend dependencies and builds
+frontend/node_modules/
+frontend/dist/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local GIS runtime data
+backend/storage/projects/
+
+# Temporary inspection files
+frontend/AppShell-inspection.txt
+
+# Local debug scripts
+backend/check_gemini_models.py
+backend/test_gemini_connection.py

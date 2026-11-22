@@ -12,6 +12,7 @@ import PrepareAreaPage from "../../features/preparation/PrepareAreaPage";
 import { useProject } from "../../context/useProject";
 import type { DatasetValidationState } from "@/types/dataset";
 import { updateProjectDates } from "../../api/client";
+import AssistantPage from "../../features/assistant/AssistantPage";
 
 type AnalysisMode = "vegetation" | "wetland";
 
@@ -573,7 +574,7 @@ export default function AppShell() {
     if (activeItem === "Results") return <ResultsPage />;
     if (activeItem === "Validation") return <ValidationPage />;
     if (activeItem === "Report") return <ReportPage analysisMode={analysisMode} />;
-
+    if (activeItem === "AI Assistant") return <AssistantPage />;
     return null;
   };
 

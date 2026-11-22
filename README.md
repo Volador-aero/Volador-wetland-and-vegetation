@@ -55,6 +55,8 @@ The web app opens at `http://localhost:5173`.
 
 ---
 
+
+
 ## 3. Running Automated Tests
 
 ### 1. Scientific GIS Engine Unit Tests (265 Tests)
@@ -81,3 +83,48 @@ python -m pytest backend/tests/test_e2e_full_integration.py
 - **4 Vegetation Classes**: `0=Background`, `1=Severe Stress`, `2=Moderate Stress`, `3=Healthy Vegetation`.
 - **Authoritative Change Analysis**: 4×4 Transition Matrix, Change Vector Analysis (CVA), Vegetation Degradation/Recovery, and NDWI Surface Water extent.
 - **Physical Wetland Depletion**: Claimed ONLY when independent temporal wetland spatial evidence is accepted via configuration.
+
+
+---
+
+## 5. AETHRA AI Assistant
+
+AETHRA is an AI-powered assistant integrated into the GIS application. It helps users understand GIS and remote-sensing concepts and answer questions using available project, dataset preparation, and completed analysis context.
+
+### Backend dependencies
+
+Install the additional Python packages:
+
+```bash
+pip install openai python-dotenv
+```
+
+### Environment configuration
+
+Create a `.env` file inside the `backend` directory:
+
+```env
+OPENROUTER_API_KEY=your_openrouter_api_key
+OPENROUTER_MODEL=openrouter/free
+```
+
+Replace the placeholder with your own OpenRouter API key. Never commit the `.env` file.
+
+### Start the backend
+
+From the project root:
+
+```bash
+python -m uvicorn app.main:app --reload --app-dir backend
+```
+
+Backend: `http://127.0.0.1:8000`
+
+API documentation: `http://127.0.0.1:8000/docs`
+
+### Assistant API endpoints
+
+- `GET /api/assistant/status` — checks assistant backend availability.
+- `POST /api/assistant/chat` — accepts a question and returns an AI-generated response.
+
+The assistant uses OpenRouter through the OpenAI-compatible SDK and can receive verified project context when available.
