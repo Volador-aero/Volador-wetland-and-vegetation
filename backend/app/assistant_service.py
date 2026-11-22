@@ -52,6 +52,7 @@ When project context is provided:
 """
 
 
+
 def generate_assistant_response(
     question: str,
     context: dict[str, Any] | None = None,
@@ -61,14 +62,11 @@ def generate_assistant_response(
     to OpenRouter and return its generated response.
     """
 
-    # Check whether the OpenRouter API key is configured.
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured.")
 
-    # Prepare the user's message.
     user_message = f"User question:\n{question}"
 
-    # Attach verified project context when available.
     if context is not None:
         context_json = json.dumps(
             context,
@@ -82,7 +80,6 @@ def generate_assistant_response(
             f"{context_json}"
         )
 
-    # Create an OpenAI-compatible client connected to OpenRouter.
     client = OpenAI(
         api_key=OPENROUTER_API_KEY,
         base_url="https://openrouter.ai/api/v1",
@@ -90,7 +87,6 @@ def generate_assistant_response(
     )
 
     try:
-        # Send instructions and the user's message to OpenRouter.
         response = client.chat.completions.create(
             model=OPENROUTER_MODEL,
             messages=[
@@ -107,19 +103,63 @@ def generate_assistant_response(
             max_tokens=700,
         )
 
-        # Extract the generated answer.
-        answer = response.choices[0].message.content
+        # Check whether OpenRouter returned any choices.
+        if not response.choices:
+            logger.error(
+                "OpenRouter returned no choices. Model=%s, ID=%s",
+                response.model,
+                response.id,
+            )
+            raise RuntimeError("OpenRouter returned no choices.")
 
-        # Ensure the model returned usable text.
-        if not answer or not answer.strip():
+        # Extract the first response.
+        choice = response.choices[0]
+        message = choice.message
+        raw_content = message.content
+
+        # Handle string-based response content.
+        if isinstance(raw_content, str):
+            answer = raw_content.strip()
+
+        # Handle list-based response content.
+        elif isinstance(raw_content, list):
+            answer = "\n".join(
+                item.text
+                for item in raw_content
+                if getattr(item, "type", None) == "text"
+                and getattr(item, "text", None)
+            ).strip()
+
+        else:
+            answer = ""
+
+        # Log diagnostic information.
+        logger.info(
+            "OpenRouter response: model=%s, finish_reason=%s, "
+            "content_type=%s, content_length=%s, refusal=%s",
+            response.model,
+            choice.finish_reason,
+            type(raw_content).__name__,
+            len(answer),
+            bool(getattr(message, "refusal", None)),
+        )
+
+        # Handle empty responses.
+        if not answer:
+            logger.error(
+                "OpenRouter returned no usable text. "
+                "Model=%s, finish_reason=%s, usage=%s",
+                response.model,
+                choice.finish_reason,
+                response.usage,
+            )
             raise RuntimeError("OpenRouter returned an empty response.")
 
-        return answer.strip()
+        return answer
 
     except APIError:
         logger.exception("OpenRouter API request failed.")
         raise
 
     finally:
-        # Release the client's HTTP resources.
         client.close()
