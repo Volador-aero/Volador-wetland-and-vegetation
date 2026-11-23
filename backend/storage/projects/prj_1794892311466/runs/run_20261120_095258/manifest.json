@@ -1,0 +1,79 @@
+{
+    "run_id": "run_20261120_095258",
+    "generated_utc": "2026-11-20T09:53:02.262722+00:00",
+    "total_outputs": 12,
+    "outputs": [
+        {
+            "path": "vegetation/health.tif",
+            "type": "GeoTIFF",
+            "size_bytes": 618,
+            "sha256": "b89f2838002d6b44141befef2b798bb8835d6b0175f5242b0a7a67f3ff874a08"
+        },
+        {
+            "path": "vegetation/confidence.tif",
+            "type": "GeoTIFF",
+            "size_bytes": 1849,
+            "sha256": "0b77da972fdc925df9655387bd470c9b52f710086ed8c68e0cc5cd68aee1fde6"
+        },
+        {
+            "path": "vegetation/statistics.json",
+            "type": "JSON",
+            "size_bytes": 1056,
+            "sha256": "453980fd79d65074b48a30e3dd2c57d8fa81da0542a0cfb92de4b48538e61961"
+        },
+        {
+            "path": "validation/qa_report.json",
+            "type": "JSON",
+            "size_bytes": 1333,
+            "sha256": "6af2043e05662c4d0ac5a2d87665aad535ea4457765116b84acb8c02144add84"
+        },
+        {
+            "path": "analysis_result.json",
+            "type": "JSON",
+            "size_bytes": 7133,
+            "sha256": "914928dd31f27af5d08992f0787b7eb5dde16b66044094ecf0c62edb46c9d6a9"
+        },
+        {
+            "path": "reports/analysis_report.md",
+            "type": "Markdown",
+            "size_bytes": 5574,
+            "sha256": "19498c00747ea10284df54e7877576680b81c0c0e6aa47e63e856cf6439a968c"
+        },
+        {
+            "path": "reports/figures/health_t1.png",
+            "type": "PNG",
+            "size_bytes": 83736,
+            "sha256": "8a01eddd8d80ec8cebb554a7bfc2a4f51fa7c2c1234ad52c9a9d562df1ccd6a3"
+        },
+        {
+            "path": "reports/figures/confidence.png",
+            "type": "PNG",
+            "size_bytes": 82097,
+            "sha256": "41eb8043bd69c0844602eb867fe9080d904a8dc8e7add6007ab0a574a7ed3630"
+        },
+        {
+            "path": "reports/vegetation_report.pdf",
+            "type": "PDF",
+            "size_bytes": 105722,
+            "sha256": "93830a139a3ce0995e289afee6409bdf46521dcde37a8c7935cd0c457a9ff799"
+        },
+        {
+            "path": "reports/vegetation_technical_report.pdf",
+            "type": "PDF",
+            "size_bytes": 210353,
+            "sha256": "bee562ac2e9b79449134aa59cc284b452dd2fa9bbedb85242d31373d58560a20"
+        },
+        {
+            "path": "reports/FINAL_ANALYSIS_REPORT.pdf",
+            "type": "PDF",
+            "size_bytes": 105722,
+            "sha256": "93830a139a3ce0995e289afee6409bdf46521dcde37a8c7935cd0c457a9ff799"
+        },
+        {
+            "path": "metadata.json",
+            "type": "JSON",
+            "size_bytes": 1350,
+            "sha256": "a2cdd1d0f9f76fc692f5e906ec7e10a74bdc19a44b3349001126edeb7b8a1ec1"
+        }
+    ]
+}

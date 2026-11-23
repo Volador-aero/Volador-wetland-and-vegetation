@@ -78,7 +78,27 @@ class ONNXModelWrapper:
 
         # Execute session forward pass
         outputs = self.session.run([self.output_name], {self.input_name: tensor})
-        raw_logits = outputs[0]  # shape (1, 4, H, W)
+        if not outputs:
+            raise ValueError("Model returned no outputs.")
+
+        raw_logits = np.asarray(outputs[0])
+        expected_shape = (tensor.shape[0], 4, tensor.shape[2], tensor.shape[3])
+        if raw_logits.ndim != 4:
+            raise ValueError(
+                "Model output must have 4 dimensions "
+                f"(batch, classes, H, W), got {raw_logits.shape}"
+            )
+        if raw_logits.shape != expected_shape:
+            raise ValueError(
+                "Model output shape does not match the expected shape "
+                f"{expected_shape}, got {raw_logits.shape}"
+            )
+        try:
+            has_finite_values = np.isfinite(raw_logits).all()
+        except TypeError as exc:
+            raise ValueError("Model output must contain numeric values.") from exc
+        if not has_finite_values:
+            raise ValueError("Model output contains NaN or infinite values.")
         
         # Argmax along the classes dimension (axis 1)
         class_map = np.argmax(raw_logits, axis=1)  # shape (1, H, W)

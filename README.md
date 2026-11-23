@@ -81,3 +81,16 @@ python -m pytest backend/tests/test_e2e_full_integration.py
 - **4 Vegetation Classes**: `0=Background`, `1=Severe Stress`, `2=Moderate Stress`, `3=Healthy Vegetation`.
 - **Authoritative Change Analysis**: 4×4 Transition Matrix, Change Vector Analysis (CVA), Vegetation Degradation/Recovery, and NDWI Surface Water extent.
 - **Physical Wetland Depletion**: Claimed ONLY when independent temporal wetland spatial evidence is accepted via configuration.
+
+## 5. Complete Documentation
+
+See [docs/PROJECT_DOCUMENTATION.md](docs/PROJECT_DOCUMENTATION.md) for the
+complete project guide, including:
+
+- architecture and repository structure;
+- vegetation and wetland workflows;
+- input data requirements and scientific processing;
+- backend API endpoints;
+- configuration and output package details;
+- frontend workflow;
+- testing, validation, limitations, and troubleshooting.

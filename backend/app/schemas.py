@@ -167,6 +167,22 @@ class RunStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+class ReadinessCheck(BaseModel):
+    id: str
+    label: str
+    status: Literal["PASS", "WARNING", "BLOCKED"]
+    message: str
+    blocking: bool
+
+
+class AnalysisReadinessResponse(BaseModel):
+    project_id: str
+    analysis_mode: Literal["vegetation", "wetland"]
+    ready: bool
+    status: Literal["READY", "WARNING", "BLOCKED"]
+    checks: List[ReadinessCheck]
+
+
 # --- Layer ---
 class MapLayerInfo(BaseModel):
     id: str

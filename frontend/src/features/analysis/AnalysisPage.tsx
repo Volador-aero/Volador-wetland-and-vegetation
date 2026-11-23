@@ -1,7 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import AnalysisConfig from "./AnalysisConfig";
 import AnalysisInputs from "./AnalysisInputs";
+import AnalysisReadinessChecklist from "./AnalysisReadinessChecklist";
 import { useProject } from "../../context/useProject";
+import { getAnalysisReadiness } from "../../api/client";
+import type { AnalysisReadiness } from "../../api/client";
 
 type AnalysisMode = "vegetation" | "wetland";
 
@@ -28,6 +31,46 @@ export default function AnalysisPage({
     temporalQaEnabled: true,
     changeQaEnabled: true,
   });
+
+  const [readiness, setReadiness] = useState<AnalysisReadiness | null>(null);
+  const [readinessLoading, setReadinessLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function refreshReadiness() {
+      if (!project) {
+        setReadiness(null);
+        return;
+      }
+      setReadinessLoading(true);
+      try {
+        const result = await getAnalysisReadiness(
+          project.id,
+          analysisMode,
+          config.observationDatesEnabled
+        );
+        if (!cancelled) setReadiness(result);
+      } catch {
+        if (!cancelled) setReadiness(null);
+      } finally {
+        if (!cancelled) setReadinessLoading(false);
+      }
+    }
+    refreshReadiness();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    project?.id,
+    project?.t1_date,
+    project?.t2_date,
+    project?.datasets_ready,
+    project?.preparation_status,
+    project?.is_locked,
+    analysisMode,
+    config.observationDatesEnabled,
+    validation,
+  ]);
 
   const toggleConfig = <K extends keyof typeof config>(key: K) => {
     setConfig((current) => ({
@@ -70,11 +113,15 @@ export default function AnalysisPage({
   const isRunning =
     runStatus && !["COMPLETED", "FAILED"].includes(runStatus.status);
 
-  const isDatasetValid = Boolean(
-    project?.datasets_ready || validation?.valid
-  );
+  const isReadinessBlocked =
+    readinessLoading || !readiness || !readiness.ready;
 
-  const fullConfig = { ...config, analysisMode, analysis_mode: analysisMode };
+  const fullConfig = {
+    ...config,
+    analysisMode,
+    analysis_mode: analysisMode,
+    use_observation_dates: config.observationDatesEnabled,
+  };
 
   return (
     <div className="space-y-5">
@@ -111,6 +158,8 @@ export default function AnalysisPage({
         onModeChange={onAnalysisModeChange}
         onChange={handleChange}
       />
+
+      <AnalysisReadinessChecklist readiness={readiness} loading={readinessLoading} />
 
       {/* Real Step-by-Step Run Status */}
       <section className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-5">
@@ -173,8 +222,8 @@ export default function AnalysisPage({
             </div>
 
             <div className="mt-1 text-xs text-[var(--text-secondary)]">
-              {!isDatasetValid && !isRunning
-                ? "Dataset validation required before launching analysis run."
+              {isReadinessBlocked && !isRunning
+                ? "Resolve the blocked readiness checks before launching analysis."
                 : analysisMode === "vegetation"
                 ? "Launch single-date vegetation health inference (Green, Red, RedEdge, NIR → NDVI/GNDVI/NDRE)."
                 : "Launch background execution of Sentinel-2 inference, 4×4 transitions, CVA, NDWI, and PDF cartography."}
@@ -183,14 +232,14 @@ export default function AnalysisPage({
 
           <button
             type="button"
-            disabled={Boolean(isRunning) || !isDatasetValid}
+            disabled={Boolean(isRunning) || isReadinessBlocked}
             onClick={() => triggerRun(fullConfig)}
             className="rounded-md bg-[var(--accent)] px-5 py-2.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {isRunning
               ? `Executing (${runStatus.progress}%)...`
-              : !isDatasetValid
-              ? "Validation Required"
+              : isReadinessBlocked
+              ? "Readiness Blocked"
               : "Run Analysis"}
           </button>
         </div>

@@ -11,6 +11,13 @@ from app import services
 from app.routers.projects import ProjectDatesUpdate, update_project_dates
 
 
+@pytest.fixture(autouse=True)
+def isolate_run_states():
+    services.RUN_STATES.clear()
+    yield
+    services.RUN_STATES.clear()
+
+
 def _project(tmp_path):
     return {
         "id": "preflight-project",
@@ -111,10 +118,148 @@ def test_equal_override_dates_are_rejected(valid_preflight):
     assert not services.RUN_STATES
 
 
+def test_disabled_observation_dates_allow_equal_override_dates(valid_preflight):
+    services.RunWorker.preflight_run(
+        valid_preflight["id"],
+        {
+            "use_observation_dates": False,
+            "t1_date": "2023-08-14",
+            "t2_date": "2023-08-14",
+        },
+    )
+
+    assert not services.RUN_STATES
+
+
+def test_t1_later_than_t2_is_rejected(valid_preflight):
+    with pytest.raises(ValueError, match="must not be later"):
+        services.RunWorker.preflight_run(
+            valid_preflight["id"],
+            {
+                "t1_date": "2023-08-28",
+                "t2_date": "2023-08-14",
+            },
+        )
+
+    assert not services.RUN_STATES
+
+
+def test_camel_case_analysis_mode_overrides_default(valid_preflight, monkeypatch):
+    observed = {}
+
+    def validate_dataset(**kwargs):
+        observed.update(kwargs)
+        return {"valid": True, "messages": []}
+
+    monkeypatch.setattr(
+        services.DatasetService,
+        "inspect_and_validate",
+        validate_dataset,
+    )
+
+    services.RunWorker.preflight_run(
+        valid_preflight["id"],
+        {"analysisMode": "vegetation"},
+    )
+
+    assert observed["analysis_mode"] == "vegetation"
+    assert not services.RUN_STATES
+
+
 def test_valid_sample_fallback_completes_without_run_state(valid_preflight):
     services.RunWorker.preflight_run(valid_preflight["id"])
 
     assert not services.RUN_STATES
+
+
+def test_readiness_reports_blocked_equal_dates(valid_preflight, monkeypatch):
+    project = valid_preflight
+    project["t1_date"] = "2023-08-14"
+    project["t2_date"] = "2023-08-14"
+
+    readiness = services.RunWorker.get_readiness(
+        project["id"],
+        {"analysis_mode": "wetland"},
+    )
+
+    date_check = next(check for check in readiness["checks"] if check["id"] == "observation_dates")
+    assert date_check["status"] == "BLOCKED"
+    assert readiness["ready"] is False
+    assert readiness["status"] == "BLOCKED"
+
+
+def test_readiness_missing_model_is_blocked(valid_preflight, monkeypatch, tmp_path):
+    missing = tmp_path / "missing.onnx"
+    monkeypatch.setattr(services, "load_config", lambda _: _config(missing))
+
+    readiness = services.RunWorker.get_readiness(
+        valid_preflight["id"],
+        {"analysis_mode": "wetland"},
+    )
+
+    model_check = next(check for check in readiness["checks"] if check["id"] == "model_compatibility")
+    assert model_check["status"] == "BLOCKED"
+    assert readiness["ready"] is False
+
+
+def test_readiness_wetland_boundary_is_warning(valid_preflight):
+    readiness = services.RunWorker.get_readiness(
+        valid_preflight["id"],
+        {"analysis_mode": "wetland"},
+    )
+
+    boundary_check = next(check for check in readiness["checks"] if check["id"] == "wetland_boundary")
+    assert boundary_check["status"] == "WARNING"
+    assert boundary_check["blocking"] is False
+
+
+def test_readiness_vegetation_does_not_require_t2(valid_preflight):
+    readiness = services.RunWorker.get_readiness(
+        valid_preflight["id"],
+        {"analysis_mode": "vegetation"},
+    )
+
+    t2_check = next(check for check in readiness["checks"] if check["id"] == "t2_dataset")
+    assert t2_check["status"] == "PASS"
+    assert t2_check["blocking"] is False
+
+
+def test_start_run_ids_are_unique_within_same_second(monkeypatch, tmp_path):
+    project = {
+        "id": "run-id-project",
+        "analysis_mode": "wetland",
+    }
+    preparation = {
+        "status": "COMMITTED",
+        "is_locked": True,
+        "inclusion": None,
+        "manual_exclusions": [],
+    }
+
+    monkeypatch.setattr(
+        services.ProjectStore,
+        "get_project",
+        lambda _: project,
+    )
+    monkeypatch.setattr(
+        services.ProjectStore,
+        "load_preparation",
+        lambda _: preparation,
+    )
+    monkeypatch.setattr(services, "STORAGE_DIR", tmp_path)
+    monkeypatch.setattr(services.executor, "submit", lambda *args: None)
+    services.RUN_STATES.clear()
+
+    first = services.RunWorker.start_run(project["id"])
+    second = services.RunWorker.start_run(project["id"])
+
+    assert first["run_id"] != second["run_id"]
+    assert first["run_id"].startswith("run_")
+    assert second["run_id"].startswith("run_")
+    assert first["run_id"] in services.RUN_STATES
+    assert second["run_id"] in services.RUN_STATES
+
+    services.RUN_STATES.clear()
 
 
 def test_project_date_update_rejects_equal_dates(monkeypatch):

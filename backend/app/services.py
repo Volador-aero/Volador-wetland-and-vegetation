@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 from concurrent.futures import ThreadPoolExecutor
+from uuid import uuid4
 
 import numpy as np
 import rasterio
@@ -562,6 +563,229 @@ class RunWorker:
     """Manages background async execution of the GIS engine pipeline."""
 
     @classmethod
+    def get_readiness(
+        cls,
+        project_id: str,
+        config_overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build structured, non-destructive readiness information."""
+        project = ProjectStore.get_project(project_id)
+        if not project:
+            return {
+                "project_id": project_id,
+                "analysis_mode": "wetland",
+                "ready": False,
+                "status": "BLOCKED",
+                "checks": [{
+                    "id": "project",
+                    "label": "Project selected",
+                    "status": "BLOCKED",
+                    "message": "Select or create a project before starting analysis.",
+                    "blocking": True,
+                }],
+            }
+
+        overrides = config_overrides or {}
+        effective_mode = str(
+            overrides.get("analysisMode")
+            or overrides.get("analysis_mode")
+            or project.get("analysis_mode")
+            or "wetland"
+        ).strip().lower()
+        if effective_mode not in {"vegetation", "wetland"}:
+            effective_mode = "wetland"
+        is_vegetation = effective_mode == "vegetation"
+        checks: List[Dict[str, Any]] = []
+
+        def add(check_id: str, label: str, status: str, message: str):
+            checks.append({
+                "id": check_id,
+                "label": label,
+                "status": status,
+                "message": message,
+                "blocking": status == "BLOCKED",
+            })
+
+        add("project", "Project exists", "PASS", "The project is available.")
+
+        t1_dir = Path(project.get("t1_dir", ""))
+        t2_dir = Path(project.get("t2_dir", ""))
+        sample_dir = ENGINE_SRC.parent / "data" / "sample_scene"
+        user_has_t1 = t1_dir.exists() and bool(list(t1_dir.glob("*.tif")) or list(t1_dir.glob("*.TIF")))
+        user_has_t2 = t2_dir.exists() and bool(list(t2_dir.glob("*.tif")) or list(t2_dir.glob("*.TIF")))
+
+        if user_has_t1 or (sample_dir / "t1").exists():
+            add("t1_dataset", "T1 dataset available", "PASS", "T1 raster bands are available.")
+        else:
+            add("t1_dataset", "T1 dataset available", "BLOCKED", "Upload the T1 Green, Red, RedEdge, and NIR bands.")
+
+        if is_vegetation:
+            add("t2_dataset", "T2 dataset", "PASS", "T2 is not required in vegetation-only mode.")
+        elif user_has_t2 or (sample_dir / "t2").exists():
+            add("t2_dataset", "T2 dataset available", "PASS", "T2 raster bands are available.")
+        else:
+            add("t2_dataset", "T2 dataset available", "BLOCKED", "Upload the T2 Green, Red, RedEdge, and NIR bands.")
+
+        if is_vegetation:
+            selected_t1 = t1_dir if user_has_t1 else sample_dir / "t1"
+            selected_t2 = None
+        elif user_has_t1 and user_has_t2:
+            selected_t1 = t1_dir
+            selected_t2 = t2_dir
+        elif (sample_dir / "t1").exists() and (sample_dir / "t2").exists():
+            selected_t1 = sample_dir / "t1"
+            selected_t2 = sample_dir / "t2"
+        else:
+            selected_t1 = t1_dir if user_has_t1 else sample_dir / "t1"
+            selected_t2 = t2_dir if user_has_t2 else sample_dir / "t2"
+        band_mapping = {
+            "green": ["*_G.tif", "*_G.TIF", "*green.tif"],
+            "red": ["*_R.tif", "*_R.TIF", "*red.tif"],
+            "rededge": ["*_RE.tif", "*_RE.TIF", "*rededge.tif"],
+            "nir": ["*_NIR.tif", "*_NIR.TIF", "*nir.tif"],
+        }
+        validation = DatasetService.inspect_and_validate(
+            t1_dir=selected_t1,
+            t2_dir=None if is_vegetation else selected_t2,
+            band_mapping=band_mapping,
+            analysis_mode=effective_mode,
+            wetland_boundary=None,
+        )
+        missing_band_messages = [m for m in validation.get("messages", []) if "missing bands" in m]
+        if missing_band_messages:
+            add("required_bands", "Required bands detected", "BLOCKED", " ".join(missing_band_messages))
+        elif validation["valid"]:
+            add("required_bands", "Required bands detected", "PASS", "Green, Red, RedEdge, and NIR bands are present.")
+        else:
+            add("required_bands", "Required bands detected", "BLOCKED", "Required raster bands could not be detected.")
+
+        if validation["valid"]:
+            add("dataset_validation", "Raster files validated", "PASS", "The uploaded raster files passed dataset validation.")
+        else:
+            messages = "; ".join(validation.get("messages", []))
+            add("dataset_validation", "Raster files validated", "BLOCKED", messages or "Raster validation failed.")
+
+        spatial_pass = True
+        spatial_message = "T1 and T2 raster grids are spatially compatible."
+        if not is_vegetation:
+            try:
+                loader = RasterLoader(band_mapping=band_mapping)
+                t1_green = loader._find_band_file(selected_t1, "green")
+                t2_green = loader._find_band_file(selected_t2, "green")
+                with rasterio.open(t1_green) as src1, rasterio.open(t2_green) as src2:
+                    spatial_pass = (
+                        src1.width == src2.width
+                        and src1.height == src2.height
+                        and src1.crs == src2.crs
+                        and src1.transform == src2.transform
+                    )
+                if not spatial_pass:
+                    spatial_message = "T1 and T2 must have matching dimensions, CRS, and spatial transforms."
+            except Exception:
+                spatial_pass = False
+                spatial_message = "T1 and T2 raster grids could not be compared."
+        add(
+            "spatial_alignment",
+            "Spatial alignment confirmed",
+            "PASS" if spatial_pass else "BLOCKED",
+            "Vegetation mode uses T1 only." if is_vegetation else spatial_message,
+        )
+
+        use_dates = overrides.get("use_observation_dates", True)
+        t1_date = overrides.get("t1_date") or project.get("t1_date") or _extract_date_from_directory(selected_t1)
+        t2_date = (
+            overrides.get("t2_date")
+            or project.get("t2_date")
+            or (_extract_date_from_directory(selected_t2) if selected_t2 is not None else None)
+        )
+        if not is_vegetation and use_dates:
+            date_status = "PASS"
+            date_message = "T1 is earlier than T2."
+            try:
+                from datetime import datetime
+                if not t1_date or not t2_date:
+                    date_status = "BLOCKED"
+                    date_message = "Enter both T1 and T2 observation dates."
+                else:
+                    parsed_t1 = datetime.strptime(t1_date, "%Y-%m-%d")
+                    parsed_t2 = datetime.strptime(t2_date, "%Y-%m-%d")
+                    if parsed_t1 == parsed_t2:
+                        date_status = "BLOCKED"
+                        date_message = "T1 and T2 observation dates must be different."
+                    elif parsed_t1 > parsed_t2:
+                        date_status = "BLOCKED"
+                        date_message = "T1 observation date must not be later than T2."
+            except (TypeError, ValueError):
+                date_status = "BLOCKED"
+                date_message = "Observation dates must use YYYY-MM-DD format."
+        else:
+            date_status = "PASS"
+            date_message = "Observation dates are not required in vegetation-only mode."
+        add("observation_dates", "Observation dates valid", date_status, date_message)
+
+        prep = ProjectStore.load_preparation(project_id)
+        if prep and (prep.get("status") != "COMMITTED" or not prep.get("is_locked", False)):
+            add("preparation", "Preparation area locked", "BLOCKED", "Commit and lock the analysis area in the Prepare Area stage.")
+        else:
+            add("preparation", "Preparation area locked", "PASS", "The preparation area is confirmed and locked.")
+
+        try:
+            config_path = ENGINE_SRC.parent / "configs" / "config.json"
+            config = load_config(config_path)
+            model_config = config["model"]
+            model_ok = (
+                model_config.get("in_channels") == 5
+                and model_config.get("num_classes") == 4
+                and model_config.get("channel_order") == ["ndvi", "gndvi", "ndre", "nir", "rededge"]
+            )
+            if not model_ok:
+                add("model_compatibility", "Approved model ready", "BLOCKED", "The configured model is incompatible. Install the approved 5-channel, 4-class model.")
+            else:
+                model_path = Path(model_config["path"])
+                if not model_path.is_absolute():
+                    model_path = ENGINE_SRC.parent / model_path
+                if not model_path.is_file():
+                    add("model_compatibility", "Approved model ready", "BLOCKED", "The configured analysis model is missing.")
+                else:
+                    try:
+                        model = ONNXModelWrapper(str(model_path))
+                        if model.session is None:
+                            raise RuntimeError("ONNX session unavailable")
+                        input_shape = model.session.get_inputs()[0].shape
+                        output_shape = model.session.get_outputs()[0].shape
+                        input_ok = len(input_shape) >= 2 and input_shape[1] == 5
+                        output_ok = len(output_shape) >= 2 and output_shape[1] == 4
+                        if input_ok and output_ok:
+                            add("model_compatibility", "Approved model ready", "PASS", "The model supports 5 input channels and 4 output classes.")
+                        else:
+                            add("model_compatibility", "Approved model ready", "BLOCKED", "The model is incompatible. Install the approved 5-channel, 4-class model.")
+                    except Exception:
+                        add("model_compatibility", "Approved model ready", "BLOCKED", "The configured model could not be loaded. Reinstall or restore the approved model.")
+        except Exception:
+            add("model_compatibility", "Approved model ready", "BLOCKED", "The analysis model configuration could not be read.")
+
+        if is_vegetation:
+            add("vegetation_mode", "Vegetation-only mode", "WARNING", "Wetland-specific evidence and depletion claims are disabled.")
+        else:
+            boundary = project.get("wetland_boundary")
+            if boundary and Path(boundary).is_file():
+                add("wetland_boundary", "Wetland boundary available", "PASS", "A wetland boundary is configured.")
+            else:
+                add("wetland_boundary", "Wetland boundary not provided", "WARNING", "No wetland boundary is configured. Wetland extent results will be limited.")
+            add("independent_hydrology", "Independent hydrological evidence", "WARNING", "No independent hydrological dataset is configured; hydrological evidence is limited.")
+            add("physical_depletion", "Physical depletion assessment", "WARNING", "Physical wetland depletion is not assessed without independent verification.")
+
+        blocked = any(check["blocking"] for check in checks)
+        warnings = any(check["status"] == "WARNING" for check in checks)
+        return {
+            "project_id": project_id,
+            "analysis_mode": effective_mode,
+            "ready": not blocked,
+            "status": "BLOCKED" if blocked else ("WARNING" if warnings else "READY"),
+            "checks": checks,
+        }
+
+    @classmethod
     def preflight_run(
         cls,
         project_id: str,
@@ -585,8 +809,8 @@ class RunWorker:
 
         overrides = config_overrides or {}
         effective_mode = str(
-            overrides.get("analysis_mode")
-            or overrides.get("analysisMode")
+            overrides.get("analysisMode")
+            or overrides.get("analysis_mode")
             or project.get("analysis_mode")
             or "wetland"
         ).strip().lower()
@@ -773,6 +997,11 @@ class RunWorker:
                     "Analysis cannot start: T1 and T2 observation dates "
                     "must be different."
                 )
+            if parsed_t1 > parsed_t2:
+                raise ValueError(
+                    "Analysis cannot start: T1 observation date must not be "
+                    "later than T2 observation date."
+                )
         elif use_observation_dates:
             for label, date_value in (("T1", t1_date), ("T2", t2_date)):
                 if date_value:
@@ -814,7 +1043,7 @@ class RunWorker:
             ProjectStore.save_preparation(project_id, prep)
             ProjectStore.update_project(project_id, {"preparation_status": "COMMITTED", "is_locked": True, "status": "PREPARATION_COMMITTED"})
 
-        run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
         runs_dir = STORAGE_DIR / "projects" / project_id / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
         run_output_dir = runs_dir / run_id
@@ -861,7 +1090,7 @@ class RunWorker:
                     with open(config_path, "r", encoding="utf-8") as cf:
                         base_cfg = json.load(cf)
                     # Apply overrides
-                    mode_override = config_overrides.get("analysis_mode") or config_overrides.get("analysisMode")
+                    mode_override = config_overrides.get("analysisMode") or config_overrides.get("analysis_mode")
                     if mode_override:
                         base_cfg["analysis_mode"] = mode_override
                     if "cva_threshold_method" in config_overrides:
@@ -903,8 +1132,8 @@ class RunWorker:
             effective_mode = "wetland"
             if config_overrides and isinstance(config_overrides, dict):
                 effective_mode = (
-                    config_overrides.get("analysis_mode")
-                    or config_overrides.get("analysisMode")
+                    config_overrides.get("analysisMode")
+                    or config_overrides.get("analysis_mode")
                     or project.get("analysis_mode")
                     or "wetland"
                 ).lower()
