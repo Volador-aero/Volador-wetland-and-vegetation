@@ -15,6 +15,7 @@ import {
   launchRun,
   getRunStatus,
   retryRun,
+  resumeRun,
   getRunResults,
   getRunLayers,
   resetProject,
@@ -35,9 +36,14 @@ export type ManualExclusion = {
   comment: string;
 };
 
+const ACTIVE_PROJECT_STORAGE_KEY = "aethra.activeProjectId";
+
 export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
   children,
 }) => {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const workspace = React.useRef("");
+  const pendingRecovery = React.useRef<string | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [runStatus, setRunStatus] = useState<RunStatus | null>(null);
@@ -54,11 +60,14 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
   // Stable function: load run results and layers.
   // activeLayerId is intentionally excluded from deps to avoid a load loop.
   const loadRunData = useCallback(async (runId: string) => {
+    const owner = workspace.current;
     try {
       const resData = await getRunResults(runId);
+      if (workspace.current !== owner) return;
       setResults(resData);
 
       const layerList = await getRunLayers(runId);
+      if (workspace.current !== owner) return;
       setLayers(layerList);
 
       setActiveLayerId((prev) => {
@@ -72,6 +81,91 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   }, []);
 
+  const clearProjectScopedState = useCallback(() => {
+    setValidation(null);
+    setRunStatus(null);
+    setResults(null);
+    setLayers([]);
+    setActiveLayerId("t2_health");
+    setManualExclusions([]);
+    setPreparation(null);
+    setError(null);
+  }, []);
+
+  const loadProjectWorkspace = useCallback(
+    async (targetProject: Project) => {
+      workspace.current = targetProject.id;
+      pendingRecovery.current = null;
+      clearProjectScopedState();
+      setProject(targetProject);
+      localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, targetProject.id);
+
+      if (targetProject.latest_run_id) {
+        try {
+          const existingRun = await getRunStatus(targetProject.latest_run_id);
+          if (workspace.current !== targetProject.id) return;
+          setRunStatus(existingRun);
+          if (existingRun.status === "COMPLETED") {
+            await loadRunData(existingRun.run_id);
+          }
+        } catch (err) {
+          console.warn(
+            `Ignoring stale latest_run_id ${targetProject.latest_run_id}:`,
+            err
+          );
+        }
+      }
+
+      try {
+        const mode =
+          targetProject.analysis_mode === "vegetation"
+            ? "vegetation"
+            : "wetland";
+        const projectValidation = await validateDatasets(targetProject.id, mode);
+        if (workspace.current !== targetProject.id) return;
+        setValidation(projectValidation);
+        if (
+          projectValidation.valid &&
+          (!targetProject.datasets_ready || targetProject.status === "INVALID")
+        ) {
+          const updatedProject = {
+            ...targetProject,
+            datasets_ready: true,
+            status:
+              targetProject.preparation_status === "COMMITTED"
+                ? "PREPARATION_COMMITTED"
+                : "DATASETS_CONFIGURED",
+          };
+          setProject(updatedProject);
+          setProjects((current) =>
+            current.map((item) =>
+              item.id === updatedProject.id ? updatedProject : item
+            )
+          );
+        }
+      } catch {
+        // New projects are expected to have no valid dataset yet.
+      }
+
+      try {
+        const projectPreparation = await getPreparation(targetProject.id);
+        if (workspace.current !== targetProject.id) return;
+        setPreparation(projectPreparation);
+        setManualExclusions(
+          projectPreparation.manual_exclusions.map((exclusion) => ({
+            id: exclusion.id,
+            geometry: exclusion.geometry as ManualExclusion["geometry"],
+            category: exclusion.category,
+            comment: exclusion.comment,
+          }))
+        );
+      } catch {
+        // The Prepare page will retry if preparation is unavailable here.
+      }
+    },
+    [clearProjectScopedState, loadRunData]
+  );
+
   // Initialize or fetch default project on load.
   useEffect(() => {
     async function init() {
@@ -81,59 +175,21 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
 
         const existing = await getProjects();
 
-        let currentProj: Project;
-
-        if (existing.length > 0) {
-          currentProj = existing[0];
-        } else {
-          currentProj = await createProject(
+        if (existing.length === 0) {
+          existing.push(await createProject(
             "Wetland Degradation Study",
-            "Sentinel-2 5-channel temporal degradation analysis"
-          );
+            "Sentinel-2 5-channel temporal degradation analysis",
+            "Central Reserve"
+          ));
         }
+        setProjects(existing);
 
-        setProject(currentProj);
-
-        // Restore an existing run only if it still exists.
-        if (currentProj.latest_run_id) {
-          try {
-            const existingRun = await getRunStatus(currentProj.latest_run_id);
-
-            setRunStatus(existingRun);
-
-            if (existingRun.status === "COMPLETED") {
-              await loadRunData(existingRun.run_id);
-            }
-          } catch (err) {
-            console.warn(
-              `Ignoring stale latest_run_id ${currentProj.latest_run_id}:`,
-              err
-            );
-          }
-        }
-
-        // Fetch current dataset validation status.
-        try {
-          const initialMode = (currentProj.analysis_mode as "vegetation" | "wetland") ?? "wetland";
-          const val = await validateDatasets(currentProj.id, initialMode);
-          setValidation(val);
-          if (val.valid && (!currentProj.datasets_ready || currentProj.status === "INVALID")) {
-            setProject((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    datasets_ready: true,
-                    status:
-                      prev.preparation_status === "COMMITTED"
-                        ? "PREPARATION_COMMITTED"
-                        : "DATASETS_CONFIGURED",
-                  }
-                : null
-            );
-          }
-        } catch {
-          // Non-blocking initial validation check.
-        }
+        const persistedProjectId = localStorage.getItem(
+          ACTIVE_PROJECT_STORAGE_KEY
+        );
+        const currentProject =
+          existing.find((item) => item.id === persistedProjectId) ?? existing[0];
+        await loadProjectWorkspace(currentProject);
       } catch (err: unknown) {
         const message =
           err instanceof Error ? err.message : "Unknown error";
@@ -146,7 +202,47 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
     }
 
     init();
-  }, [loadRunData]);
+  }, [loadProjectWorkspace]);
+
+  const switchProject = async (projectId: string) => {
+    if (projectId === project?.id) return;
+    const targetProject = projects.find((item) => item.id === projectId);
+    if (!targetProject) return;
+
+    try {
+      setLoading(true);
+      await loadProjectWorkspace(targetProject);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to switch project");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const createNewProject = async (input: {
+    name: string;
+    aoiName: string;
+  }): Promise<Project> => {
+    try {
+      setLoading(true);
+      setError(null);
+      const created = await createProject(
+        input.name,
+        undefined,
+        input.aoiName
+      );
+      setProjects((current) => [...current, created]);
+      await loadProjectWorkspace(created);
+      return created;
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Failed to create project";
+      setError(message);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  };
 
   // Poll run status when active run is running.
   useEffect(() => {
@@ -154,9 +250,14 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
       return;
     }
 
+    let active = true;
+    let pending = false;
     const interval = setInterval(async () => {
+      if (pending) return;
+      pending = true;
       try {
         const updated = await getRunStatus(runStatus.run_id);
+        if (!active || workspace.current !== updated.project_id) return;
 
         setRunStatus(updated);
 
@@ -165,10 +266,12 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
         }
       } catch (err) {
         console.error("Status poll error:", err);
+      } finally {
+        pending = false;
       }
     }, 1000);
 
-    return () => clearInterval(interval);
+    return () => { active = false; clearInterval(interval); };
   }, [runStatus, loadRunData]);
 
   const triggerValidation = async (mode?: "vegetation" | "wetland") => {
@@ -264,6 +367,14 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
       try {
         const state = await getPreparation(pid);
         setPreparation(state);
+        setManualExclusions(
+          state.manual_exclusions.map((exclusion) => ({
+            id: exclusion.id,
+            geometry: exclusion.geometry as ManualExclusion["geometry"],
+            category: exclusion.category,
+            comment: exclusion.comment,
+          }))
+        );
         return state;
       } catch (err) {
         console.warn("fetchPreparation failed:", err);
@@ -392,6 +503,8 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
       );
 
       const initialRun = await launchRun(project.id, runConfig);
+      setProjects(items => items.map(p => p.id === project.id ? {...p, latest_run_id: initialRun.run_id} : p));
+      if (workspace.current !== project.id) return;
 
       // The backend-generated run_id is authoritative.
       setRunStatus(initialRun);
@@ -402,8 +515,10 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   };
 
-  const retryActiveRun = async () => {
-    if (!runStatus?.run_id) return;
+  const recoverRun = async (action: typeof retryRun) => {
+    if (!runStatus?.run_id || pendingRecovery.current) return;
+    const owner = workspace.current;
+    pendingRecovery.current = runStatus.run_id;
 
     try {
       setLoading(true);
@@ -411,11 +526,16 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
       setResults(null);
       setLayers([]);
       setActiveLayerId("");
-      setRunStatus(await retryRun(runStatus.run_id));
+      const updated = await action(runStatus.run_id);
+      setProjects(items => items.map(p => p.id === owner ? {...p, latest_run_id: updated.run_id} : p));
+      if (workspace.current === owner) setRunStatus(updated);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Unable to retry run");
+      if (workspace.current === owner) setError(err instanceof Error ? err.message : "Unable to recover run");
     } finally {
-      setLoading(false);
+      if (workspace.current === owner) {
+        pendingRecovery.current = null;
+        setLoading(false);
+      }
     }
   };
 
@@ -428,6 +548,7 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
   return (
     <ProjectContext.Provider
       value={{
+        projects,
         project,
         validation,
         runStatus,
@@ -440,11 +561,15 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
         manualExclusions,
         preparation,
 
+        switchProject,
+        createNewProject,
+
         setActiveLayerId,
         triggerValidation,
         uploadBand,
         triggerRun,
-        retryActiveRun,
+        retryActiveRun: () => recoverRun(retryRun),
+        resumeActiveRun: () => recoverRun(resumeRun),
         refreshResults,
         updateManualExclusion,
         addManualExclusion,

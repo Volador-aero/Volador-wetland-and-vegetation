@@ -28,6 +28,8 @@ ENGINE_SRC = Path(__file__).resolve().parent.parent / "Engine_module" / "src"
 if str(ENGINE_SRC) not in sys.path:
     sys.path.insert(0, str(ENGINE_SRC))
 
+from threading import RLock
+from gis_engine.core.checkpoints import Checkpoints, PLANS, fingerprint
 from gis_engine.api.service import analyze_wetland
 from gis_engine.ingestion.loader import RasterLoader
 from gis_engine.ingestion.validator import InputValidator
@@ -119,7 +121,30 @@ class ProjectStore:
             return {}
         try:
             with open(file_path, "r") as f:
-                return json.load(f)
+                projects = json.load(f)
+
+            # Project dataset directories are workspace-owned. Older project
+            # records may contain absolute paths from the machine where the
+            # repository was created, so rebuild them from the current
+            # STORAGE_DIR every time the registry is loaded.
+            changed = False
+            for project_id, project in projects.items():
+                project_root = STORAGE_DIR / "projects" / project_id
+                expected_paths = {
+                    "t1_dir": project_root / "datasets" / "t1",
+                    "t2_dir": project_root / "datasets" / "t2",
+                }
+                for key, expected_path in expected_paths.items():
+                    expected_path.mkdir(parents=True, exist_ok=True)
+                    expected_value = str(expected_path)
+                    if project.get(key) != expected_value:
+                        project[key] = expected_value
+                        changed = True
+
+            if changed:
+                cls.save_projects(projects)
+
+            return projects
         except Exception:
             return {}
 
@@ -594,8 +619,16 @@ class DatasetService:
         }
 
 
+class ResumeConflict(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 class RunWorker:
     """Manages background async execution of the GIS engine pipeline."""
+
+    _resume_lock = RLock()
 
     @staticmethod
     def _state_path(output_dir: Path) -> Path:
@@ -740,6 +773,8 @@ class RunWorker:
             "output_directory": str(run_output_dir),
             "config_overrides": config_overrides or {},
             "retry_of": retry_of,
+            "attempt_id": "attempt_1",
+            "checkpoints_enabled": os.getenv("ENABLE_STAGE_RESUME", "false").lower() in {"true", "1"},
         }
         cls._persist_state(run_info, run_output_dir)
         _write_json_atomically(
@@ -752,6 +787,7 @@ class RunWorker:
         )
         RUN_STATES[run_id] = run_info
 
+        ProjectStore.update_project(project_id, {"latest_run_id": run_id})
         # Launch background task
         executor.submit(cls._execute_pipeline, run_id, project, run_output_dir, config_overrides)
         return run_info
@@ -775,6 +811,9 @@ class RunWorker:
                 model_path = config_path
 
             # If caller supplied custom run configurations, write a runtime config snapshot
+            config_overrides = dict(config_overrides or {})
+            if not (config_overrides.get("analysis_mode") or config_overrides.get("analysisMode")):
+                config_overrides["analysis_mode"] = project.get("analysis_mode") or "wetland"
             if config_overrides and isinstance(config_overrides, dict):
                 try:
                     with open(config_path, "r", encoding="utf-8") as cf:
@@ -812,7 +851,7 @@ class RunWorker:
                         json.dump(base_cfg, cf, indent=2)
                     config_path = custom_cfg_path
                 except Exception as exc:
-                    logger.warning("Failed to write config_overrides snapshot: %s", exc)
+                    raise ValueError(f"Could not save the effective run configuration: {exc}") from exc
 
             t1_dir = Path(project["t1_dir"])
             t2_dir = Path(project["t2_dir"])
@@ -917,54 +956,116 @@ class RunWorker:
                     run_id,
                 )
 
-            cls._transition(
-                run_info,
-                output_dir,
-                status="PREPROCESSING",
-                progress=25,
-                current_step="Spatial Alignment & Preprocessing",
-            )
+            arguments = {
+                "t1_scene": str(t1_dir), "t2_scene": None if is_vegetation_mode else str(t2_dir),
+                "t1_date": t1_date or ("single-date" if is_vegetation_mode else None),
+                "t2_date": None if is_vegetation_mode else t2_date,
+                "config_path": str(config_path), "model_path": str(model_path),
+                "wetland_boundary": str(wetland_boundary) if wetland_boundary else None,
+            }
+            if run_info.get("checkpoints_enabled"):
+                run_info["checkpoint_arguments"] = arguments
+                run_info["checkpoint_signature"] = fingerprint(arguments)
+                run_info["checkpoint_mode"] = effective_mode
+                run_info["project_signature"] = cls._project_signature(project["id"])
+                cls._persist_state(run_info, output_dir)
+            cls._run_engine(run_info, output_dir, arguments, resume=False)
+        except Exception as exc:
+            cls._transition(run_info, output_dir, status="FAILED", completed=True, error=str(exc))
 
-            time.sleep(0.5)
-            cls._transition(
-                run_info,
-                output_dir,
-                status="INFERENCE",
-                progress=45,
-                current_step="Model Inference (5-Channel Sentinel-2)",
-            )
+    @staticmethod
+    def _project_signature(project_id):
+        p = ProjectStore.get_project(project_id) or {}
+        keys = ("analysis_mode", "t1_date", "t2_date", "wetland_boundary", "t1_dir", "t2_dir", "aoi_name")
+        values = {key: p.get(key) for key in keys}
+        prep = ProjectStore.load_preparation(project_id) or {}
+        values["geometry"] = [prep.get(key) for key in ("inclusion", "manual_exclusions", "is_locked")]
+        # Sample fallback must also detect newly uploaded user data.
+        values["datasets"] = [sorted((f.name, f.stat().st_size, f.stat().st_mtime_ns)
+                                     for f in Path(p[key]).glob("*") if f.is_file())
+                              for key in ("t1_dir", "t2_dir") if p.get(key)]
+        return json.dumps(values, sort_keys=True)
 
-            time.sleep(0.5)
-            cls._transition(
-                run_info,
-                output_dir,
-                status="CHANGE_ANALYSIS",
-                progress=65,
-                current_step="4x4 Transition Analysis & CVA",
-            )
+    @classmethod
+    def inspect_resume(cls, state):
+        blocked = {"resume_available": False}
+        if state.get("status") not in {"INTERRUPTED", "FAILED"}:
+            active = state.get("status") not in TERMINAL_RUN_STATUSES
+            return dict(blocked, code="RUN_ALREADY_ACTIVE" if active else "RUN_NOT_INTERRUPTED",
+                        resume_blocked_reason="Run is already active or completed")
+        try:
+            if not state.get("checkpoint_arguments"):
+                raise ResumeConflict("CHECKPOINT_NOT_FOUND", "This run has no stage checkpoints. Retry starts a fresh run.")
+            root = cls._run_dir_from_index(state["run_id"])
+            if not root or root != STORAGE_DIR / "projects" / state["project_id"] / "runs" / state["run_id"]:
+                raise ValueError("Run index does not match the project")
+            if cls._project_signature(state["project_id"]) != state.get("project_signature"):
+                raise ResumeConflict("CHECKPOINT_INCOMPATIBLE", "Project data or preparation changed. Start a fresh run.")
+            signature = fingerprint(state["checkpoint_arguments"])
+            if signature != state.get("checkpoint_signature"):
+                raise ResumeConflict("CHECKPOINT_INCOMPATIBLE", "Scientific inputs, configuration, model or code changed.")
+            store = Checkpoints(root, state["checkpoint_mode"], signature, resume=True)
+            stages = list(store.records)
+            if not stages:
+                raise ValueError("No valid stage checkpoint is available")
+            return {"resume_available": True, "resume_blocked_reason": None,
+                    "last_completed_stage": stages[-1],
+                    "next_stage": next((s for s in store.plan if s not in stages), "FINALIZE")}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return dict(blocked, code=getattr(exc, "code", "CHECKPOINT_CORRUPT"), resume_blocked_reason=str(exc))
 
-            # Execute real GIS analysis engine
-            res = analyze_wetland(
-                t1_scene=t1_dir,
-                t2_scene=None if is_vegetation_mode else t2_dir,
-                t1_date=t1_date if t1_date else ("single-date" if is_vegetation_mode else None),
-                t2_date=None if is_vegetation_mode else t2_date,
-                config_path=config_path,
-                model_path=model_path,
-                output_dir=output_dir.parent,
-                wetland_boundary=wetland_boundary,
-                run_id=run_id,
-            )
+    @classmethod
+    def resume_run(cls, run_id):
+        with cls._resume_lock:
+            state = cls.get_run_status(run_id)
+            if not state:
+                raise KeyError(run_id)
+            info = cls.inspect_resume(state)
+            if not info["resume_available"]:
+                raise ResumeConflict(info["code"], info["resume_blocked_reason"])
+            root = cls._run_dir_from_index(run_id)
+            count = state.get("resume_count", 0) + 1
+            state.update(info, resume_count=count, attempt_id=f"attempt_{count + 1}",
+                         completed_at=None, error=None, resume_available=False)
+            cls._transition(state, root, status="RESUMING", current_step="Loading checkpoint",
+                            message=f"Continuing from {info['last_completed_stage']}")
+            accepted = dict(state)
+            try:
+                executor.submit(cls._run_engine, state, root, state["checkpoint_arguments"], True)
+            except RuntimeError as exc:
+                cls._transition(state, root, status="INTERRUPTED", error=str(exc), completed=True)
+                raise
+            return accepted
 
-            cls._transition(
-                run_info,
-                output_dir,
-                status="REPORTING",
-                progress=90,
-                current_step="Generating PDF Cartographic Report",
-            )
+    @classmethod
+    def _run_engine(cls, run_info, output_dir, arguments, resume):
+        run_id = run_info["run_id"]
+        stages = {
+            "INPUT_VALIDATION": ("VALIDATING", 10), "PREPROCESSING": ("PREPROCESSING", 25),
+            "ALIGNMENT": ("ALIGNING", 25), "VEGETATION_INFERENCE": ("INFERENCE", 45),
+            "CHANGE_ANALYSIS": ("CHANGE_ANALYSIS", 65), "WETLAND_ANALYSIS": ("HYDROLOGY", 75),
+            "METRICS_QA": ("METRICS", 85), "REPORTING": ("REPORTING", 90),
+        }
+
+        def on_stage(stage):
+            status, progress = stages[stage]
+            label = stage.replace("_", " ").title()
+            if run_info.get("checkpoint_signature"):
+                plan = PLANS[run_info["checkpoint_mode"]]
+                index = plan.index(stage)
+                run_info["last_completed_stage"] = plan[index - 1] if index else None
+                run_info["next_stage"] = stage
+            cls._transition(run_info, output_dir, status=status, progress=progress,
+                            current_step=label, message=label)
+
+        try:
+            res = analyze_wetland(**arguments, output_dir=output_dir.parent, run_id=run_id,
+                                  checkpoint_signature=run_info.get("checkpoint_signature"),
+                                  resume=resume, stage_callback=on_stage)
 
             if res.status in ["SUCCESS", "WARNING"]:
+                if run_info.get("checkpoint_signature"):
+                    run_info.update(last_completed_stage="REPORTING", next_stage=None)
                 cls._transition(
                     run_info,
                     output_dir,
@@ -974,7 +1075,9 @@ class RunWorker:
                     message="Analysis completed successfully",
                     completed=True,
                 )
-                ProjectStore.update_project(project["id"], {"latest_run_id": run_id, "status": "ANALYZED"})
+                current = ProjectStore.get_project(run_info["project_id"])
+                if current and current.get("latest_run_id") == run_id:
+                    ProjectStore.update_project(run_info["project_id"], {"status": "ANALYZED"})
             else:
                 cls._transition(
                     run_info,
@@ -1034,7 +1137,8 @@ class RunWorker:
         if indexed_run_dir is not None:
             durable_state = _read_json_object(cls._state_path(indexed_run_dir))
             if durable_state is not None:
-                return cls._recover_durable_state(run_id, indexed_run_dir, durable_state)
+                with cls._resume_lock:
+                    return RUN_STATES.get(run_id) or cls._recover_durable_state(run_id, indexed_run_dir, durable_state)
 
             recovery_error = {
                 "run_id": run_id,

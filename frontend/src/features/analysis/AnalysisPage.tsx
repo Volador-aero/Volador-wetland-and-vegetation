@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { checkResume, type ResumeCheck } from "../../api/client";
 import AnalysisConfig from "./AnalysisConfig";
 import AnalysisInputs from "./AnalysisInputs";
 import { useProject } from "../../context/useProject";
+import type { RunStatus } from "../../api/client";
 
 type AnalysisMode = "vegetation" | "wetland";
 
@@ -10,11 +12,111 @@ type AnalysisPageProps = {
   onAnalysisModeChange: (mode: AnalysisMode) => void;
 };
 
+const runStatePresentation: Record<
+  RunStatus["status"],
+  { label: string; description: string; badgeClass: string; dotClass: string }
+> = {
+  QUEUED: {
+    label: "Queued",
+    description: "The run is saved and waiting for a background worker.",
+    badgeClass: "border-slate-400/40 bg-slate-500/10 text-slate-600 dark:text-slate-300",
+    dotClass: "bg-slate-500 animate-pulse",
+  },
+  RESUMING: {
+    label: "Resuming",
+    description: "Loading saved stages for this run.",
+    badgeClass: "border-blue-500/40 bg-blue-500/10 text-blue-700",
+    dotClass: "bg-blue-500 animate-pulse",
+  },
+  VALIDATING: {
+    label: "Validating",
+    description: "Checking the uploaded raster inputs and run configuration.",
+    badgeClass: "border-blue-500/40 bg-blue-500/10 text-blue-700 dark:text-blue-300",
+    dotClass: "bg-blue-500 animate-pulse",
+  },
+  ALIGNING: {
+    label: "Aligning rasters",
+    description: "Aligning source rasters to a common spatial grid.",
+    badgeClass: "border-cyan-500/40 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300",
+    dotClass: "bg-cyan-500 animate-pulse",
+  },
+  PREPROCESSING: {
+    label: "Preprocessing",
+    description: "Preparing aligned input data for model inference.",
+    badgeClass: "border-cyan-500/40 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300",
+    dotClass: "bg-cyan-500 animate-pulse",
+  },
+  INFERENCE: {
+    label: "Running model",
+    description: "Executing vegetation classification with the ONNX model.",
+    badgeClass: "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+    dotClass: "bg-violet-500 animate-pulse",
+  },
+  CHANGE_ANALYSIS: {
+    label: "Analysing change",
+    description: "Calculating transitions and change-vector statistics.",
+    badgeClass: "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+    dotClass: "bg-violet-500 animate-pulse",
+  },
+  HYDROLOGY: {
+    label: "Analysing hydrology",
+    description: "Calculating water and wetland evidence.",
+    badgeClass: "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300",
+    dotClass: "bg-sky-500 animate-pulse",
+  },
+  METRICS: {
+    label: "Calculating metrics",
+    description: "Producing area and degradation measurements.",
+    badgeClass: "border-indigo-500/40 bg-indigo-500/10 text-indigo-700 dark:text-indigo-300",
+    dotClass: "bg-indigo-500 animate-pulse",
+  },
+  VALIDATION: {
+    label: "Checking outputs",
+    description: "Running quality checks on generated outputs.",
+    badgeClass: "border-blue-500/40 bg-blue-500/10 text-blue-700 dark:text-blue-300",
+    dotClass: "bg-blue-500 animate-pulse",
+  },
+  REPORTING: {
+    label: "Generating report",
+    description: "Creating final reports and output metadata.",
+    badgeClass: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+    dotClass: "bg-amber-500 animate-pulse",
+  },
+  COMPLETED: {
+    label: "Completed",
+    description: "The analysis and all output files completed successfully.",
+    badgeClass: "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+    dotClass: "bg-emerald-500",
+  },
+  FAILED: {
+    label: "Failed",
+    description: "The run stopped because an execution error occurred.",
+    badgeClass: "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300",
+    dotClass: "bg-red-500",
+  },
+  INTERRUPTED: {
+    label: "Interrupted",
+    description: "The backend restarted before this run could finish.",
+    badgeClass: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+    dotClass: "bg-amber-500",
+  },
+};
+
 export default function AnalysisPage({
   analysisMode,
   onAnalysisModeChange,
 }: AnalysisPageProps) {
-  const { project, validation, runStatus, triggerRun, retryActiveRun } = useProject();
+  const { project, validation, runStatus, triggerRun, retryActiveRun, resumeActiveRun, loading } = useProject();
+  const [check, setCheck] = useState<ResumeCheck | null>(null);
+  useEffect(() => {
+    let active = true;
+    setCheck(null);
+    if (runStatus && ["FAILED", "INTERRUPTED"].includes(runStatus.status)) {
+      checkResume(runStatus.run_id).then(info => { if (active) setCheck(info); })
+        .catch(() => { if (active) setCheck({resume_available: false, resume_blocked_reason: "Could not check saved stages."}); });
+    }
+    return () => { active = false; };
+  }, [runStatus?.run_id, runStatus?.status]);
 
   const [config, setConfig] = useState({
     observationDatesEnabled: true,
@@ -75,6 +177,9 @@ export default function AnalysisPage({
   );
 
   const fullConfig = { ...config, analysisMode, analysis_mode: analysisMode };
+  const displayedRunState = runStatus
+    ? runStatePresentation[runStatus.status]
+    : null;
 
   return (
     <div className="space-y-5">
@@ -127,9 +232,25 @@ export default function AnalysisPage({
             </div>
           </div>
 
-          <div className="rounded-md border border-[var(--border)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.12em] text-[var(--text)]">
-            {runStatus?.status || "IDLE"}
+          <div
+            className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-xs font-semibold ${
+              displayedRunState
+                ? displayedRunState.badgeClass
+                : "border-[var(--border)] text-[var(--text-secondary)]"
+            }`}
+          >
+            <span
+              className={`h-2 w-2 rounded-full ${
+                displayedRunState?.dotClass ?? "bg-[var(--text-secondary)]"
+              }`}
+            />
+            {displayedRunState?.label ?? "Not started"}
           </div>
+        </div>
+
+        <div className="mt-3 text-xs text-[var(--text-secondary)]">
+          {displayedRunState?.description ??
+            "No run state has been created for this project."}
         </div>
 
         {/* Progress Bar */}
@@ -149,22 +270,36 @@ export default function AnalysisPage({
           </div>
         )}
 
+        {runStatus && (
+          <div className="mt-2 text-[11px] text-[var(--text-secondary)]">
+            Run {runStatus.run_id}{runStatus.resume_count ? ` · Resumed ${runStatus.resume_count} time(s)` : ""}.
+          </div>
+        )}
+
         {runStatus?.error && (
           <div className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
             Execution Failure: {runStatus.error}
           </div>
         )}
 
-        {runStatus?.status === "INTERRUPTED" && (
+        {runStatus && ["INTERRUPTED", "FAILED"].includes(runStatus.status) && (
           <div className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
             <div>{runStatus.message || "The backend stopped before analysis completed."}</div>
             <button
+              disabled={loading}
               type="button"
               onClick={retryActiveRun}
               className="mt-2 rounded bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
             >
               Retry Analysis
             </button>
+            {check?.resume_available ? (
+              <div className="mt-2">
+                <div>Last saved stage: {check.last_completed_stage}. Continue at {check.next_stage}.</div>
+                <button type="button" disabled={loading} onClick={resumeActiveRun}
+                  className="mt-2 rounded bg-blue-700 px-3 py-1.5 text-white">Resume from checkpoint</button>
+              </div>
+            ) : <div className="mt-2">{check?.resume_blocked_reason || "Checking saved stages…"}</div>}
           </div>
         )}
       </section>

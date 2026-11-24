@@ -13,6 +13,8 @@ sys.path.insert(0, str(BACKEND_DIR))
 sys.path.insert(0, str(BACKEND_DIR / "Engine_module" / "src"))
 
 from app import services
+from gis_engine.core.exceptions import OutputError
+from gis_engine.core.pipeline import _prepare_run_directory
 
 
 class RecordingExecutor:
@@ -162,6 +164,45 @@ class DurableRunStateTests(unittest.TestCase):
             retried["config_overrides"], {"analysis_mode": "wetland"}
         )
         self.assertTrue(executor.state_existed_at_submit)
+
+    def test_project_paths_are_rebased_to_current_storage_root(self):
+        project_id = "project_from_another_machine"
+        stale_projects = {
+            project_id: {
+                "id": project_id,
+                "t1_dir": r"C:\Users\OtherUser\old-project\datasets\t1",
+                "t2_dir": r"C:\Users\OtherUser\old-project\datasets\t2",
+            }
+        }
+        services._write_json_atomically(
+            self.storage_root / "projects.json", stale_projects
+        )
+
+        loaded = services.ProjectStore.load_projects()
+
+        expected_root = self.storage_root / "projects" / project_id / "datasets"
+        self.assertEqual(loaded[project_id]["t1_dir"], str(expected_root / "t1"))
+        self.assertEqual(loaded[project_id]["t2_dir"], str(expected_root / "t2"))
+        self.assertTrue((expected_root / "t1").is_dir())
+        self.assertTrue((expected_root / "t2").is_dir())
+
+    def test_engine_accepts_directory_reserved_by_durable_state(self):
+        run_dir = self.storage_root / "reserved-run"
+        run_dir.mkdir()
+        (run_dir / "run_state.json").write_text("{}", encoding="utf-8")
+
+        _prepare_run_directory(run_dir)
+
+        self.assertTrue((run_dir / "run_state.json").is_file())
+
+    def test_engine_rejects_directory_with_previous_analysis_output(self):
+        run_dir = self.storage_root / "existing-run"
+        run_dir.mkdir()
+        (run_dir / "run_state.json").write_text("{}", encoding="utf-8")
+        (run_dir / "metrics").mkdir()
+
+        with self.assertRaises(OutputError):
+            _prepare_run_directory(run_dir)
 
 
 if __name__ == "__main__":

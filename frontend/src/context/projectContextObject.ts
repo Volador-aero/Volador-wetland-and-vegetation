@@ -16,6 +16,7 @@ import type {
 import type { ManualExclusion } from "./ProjectContext";
 
 export interface ProjectContextType {
+  projects: Project[];
   project: Project | null;
   validation: ValidationResult | null;
   runStatus: RunStatus | null;
@@ -26,6 +27,11 @@ export interface ProjectContextType {
   error: string | null;
   manualExclusions: ManualExclusion[];
   preparation: PreparationState | null;
+  switchProject: (projectId: string) => Promise<void>;
+  createNewProject: (input: {
+    name: string;
+    aoiName: string;
+  }) => Promise<Project>;
   addManualExclusion: (exclusion: ManualExclusion) => void;
   updateManualExclusion: (exclusion: ManualExclusion) => void;
   removeManualExclusion: (id: string) => void;
@@ -41,6 +47,7 @@ export interface ProjectContextType {
   ) => Promise<void>;
   triggerRun: (config?: Record<string, any>) => Promise<void>;
   retryActiveRun: () => Promise<void>;
+  resumeActiveRun: () => Promise<void>;
   refreshResults: () => Promise<void>;
   fetchPreparation: (projectId?: string) => Promise<PreparationState | undefined>;
   saveDraft: (inclusion: Record<string, any> | null, exclusions: ManualExclusion[]) => Promise<void>;

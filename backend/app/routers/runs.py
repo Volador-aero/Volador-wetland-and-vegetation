@@ -7,7 +7,7 @@ Router for initiating analysis runs and checking run execution status.
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, status
 from ..schemas import RunCreateRequest, RunStatusResponse
-from ..services import RunWorker, ProjectStore, DatasetService, ENGINE_SRC
+from ..services import RunWorker, ResumeConflict, ProjectStore, DatasetService, ENGINE_SRC
 
 router = APIRouter(prefix="/api/runs", tags=["Runs"])
 
@@ -120,3 +120,23 @@ def retry_run(run_id: str):
         return RunWorker.retry_run(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get("/{run_id}/resume-check")
+def check_resume(run_id: str):
+    state = RunWorker.get_run_status(run_id)
+    if not state:
+        raise HTTPException(404, detail="Run not found")
+    return RunWorker.inspect_resume(state)
+
+
+@router.post("/{run_id}/resume", response_model=RunStatusResponse, status_code=202)
+def resume_run(run_id: str):
+    try:
+        return RunWorker.resume_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(404, detail="Run not found") from exc
+    except ResumeConflict as exc:
+        raise HTTPException(409, detail={"code": exc.code, "message": str(exc)}) from exc
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(503, detail={"code": "RESUME_UNAVAILABLE", "message": str(exc)}) from exc

@@ -79,10 +79,14 @@ export interface ValidationResult {
 }
 
 export interface RunStatus {
+  resume_count?: number;
+  last_completed_stage?: string;
+  next_stage?: string;
   run_id: string;
   project_id: string;
   status:
     | "QUEUED"
+    | "RESUMING"
     | "VALIDATING"
     | "ALIGNING"
     | "PREPROCESSING"
@@ -279,7 +283,7 @@ async function handleResponseError(res: Response, defaultMessage: string): Promi
   try {
     const data = await res.json();
     if (data?.detail) {
-      detailMessage = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+      detailMessage = typeof data.detail === "string" ? data.detail : data.detail.message ?? JSON.stringify(data.detail);
     } else if (data?.error?.message) {
       detailMessage = data.error.message;
     }
@@ -298,11 +302,21 @@ export async function fetchHealth(): Promise<boolean> {
   }
 }
 
-export async function createProject(name: string, description?: string): Promise<Project> {
+export async function createProject(
+  name: string,
+  description?: string,
+  aoiName: string = "Central Reserve",
+  analysisMode: "vegetation" | "wetland" = "wetland"
+): Promise<Project> {
   const res = await fetch(`${API_BASE}/projects`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description, aoi_name: "Central Reserve" }),
+    body: JSON.stringify({
+      name,
+      description,
+      aoi_name: aoiName,
+      analysis_mode: analysisMode,
+    }),
   });
   if (!res.ok) await handleResponseError(res, "Failed to create project");
   return res.json();
@@ -411,6 +425,25 @@ export async function retryRun(runId: string): Promise<RunStatus> {
     method: "POST",
   });
   if (!res.ok) await handleResponseError(res, "Failed to retry analysis run");
+  return res.json();
+}
+
+export interface ResumeCheck {
+  resume_available: boolean;
+  resume_blocked_reason?: string;
+  last_completed_stage?: string;
+  next_stage?: string;
+}
+
+export async function checkResume(runId: string): Promise<ResumeCheck> {
+  const res = await fetch(`${API_BASE}/runs/${runId}/resume-check`);
+  if (!res.ok) await handleResponseError(res, "Unable to check saved stages");
+  return res.json();
+}
+
+export async function resumeRun(runId: string): Promise<RunStatus> {
+  const res = await fetch(`${API_BASE}/runs/${runId}/resume`, { method: "POST" });
+  if (!res.ok) await handleResponseError(res, "Unable to resume analysis");
   return res.json();
 }
 

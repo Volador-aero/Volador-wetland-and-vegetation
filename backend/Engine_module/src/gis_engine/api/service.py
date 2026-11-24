@@ -30,6 +30,9 @@ def analyze_wetland(
     wetland_boundary: Optional[Union[str, Path]] = None,
     run_id: Optional[str] = None,
     log_level: str = "INFO",
+    checkpoint_signature=None,
+    resume=False,
+    stage_callback=None,
 ) -> AnalysisResult:
     """
     Analyses vegetation health change and surface-water change between two
@@ -135,6 +138,9 @@ def analyze_wetland(
         wetland_boundary=wetland_boundary,
         run_id=run_id,
         log_level=log_level,
+        checkpoint_signature=checkpoint_signature,
+        resume=resume,
+        stage_callback=stage_callback,
     )
 
     logger.info(
