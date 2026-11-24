@@ -10,7 +10,6 @@ from app.main import app
 
 client = TestClient(app)
 
-
 def test_assistant_status():
     response = client.get("/api/assistant/status")
 
@@ -18,6 +17,7 @@ def test_assistant_status():
 
     data = response.json()
 
-    assert data["status"] == "INITIALIZED"
-    assert data["feature"] == "AETHRA Assistant"
-    assert data["message"] == "Assistant backend is reachable."
+    assert data["status"] in ["READY", "NOT_CONFIGURED"]
+    assert isinstance(data["configured"], bool)
+    assert "model" in data
+    assert "message" in data

@@ -138,10 +138,59 @@ class ProjectStore:
         cls.save_projects(projects)
         return project_data
 
+    @staticmethod
+    def project_directory(project_id: str) -> Path:
+        """Return the canonical on-disk directory for a project.
+
+        Never derive a filesystem path from t1_dir/t2_dir values stored in
+        projects.json. Those values may have been created on another machine.
+        """
+        if not isinstance(project_id, str) or not re.fullmatch(r"prj_[A-Za-z0-9_-]+", project_id):
+            raise ValueError("Invalid project ID")
+
+        projects_root = (STORAGE_DIR / "projects").resolve()
+        project_dir = (projects_root / project_id).resolve()
+        if not project_dir.is_relative_to(projects_root):
+            raise ValueError("Project path is outside the projects storage directory")
+        return project_dir
+
+    @classmethod
+    def dataset_directory(cls, project_id: str, time_point: str) -> Path:
+        """Return the canonical T1 or T2 directory for a project."""
+        if time_point not in {"t1", "t2"}:
+            raise ValueError("time_point must be 't1' or 't2'")
+        return cls.project_directory(project_id) / "datasets" / time_point
+
+    @classmethod
+    def normalize_project_paths(cls, project: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a project copy whose filesystem paths are local and safe."""
+        normalized = dict(project)
+        project_id = normalized.get("id")
+        project_dir = cls.project_directory(project_id)
+        normalized["t1_dir"] = str(cls.dataset_directory(project_id, "t1"))
+        normalized["t2_dir"] = str(cls.dataset_directory(project_id, "t2"))
+
+        # A saved boundary is usable only when it is inside this project's
+        # current workspace. Old-machine absolute paths are deliberately ignored.
+        boundary_value = normalized.get("wetland_boundary")
+        safe_boundary = None
+        if boundary_value:
+            try:
+                candidate = Path(boundary_value).resolve()
+                if candidate.is_relative_to(project_dir) and candidate.is_file():
+                    safe_boundary = str(candidate)
+            except (OSError, TypeError, ValueError):
+                safe_boundary = None
+        normalized["wetland_boundary"] = safe_boundary
+        return normalized
+
     @classmethod
     def get_project(cls, project_id: str) -> Optional[Dict[str, Any]]:
         projects = cls.load_projects()
-        return projects.get(project_id)
+        project = projects.get(project_id)
+        if not project:
+            return None
+        return cls.normalize_project_paths(project)
 
     @classmethod
     def delete_project(cls, project_id: str) -> bool:
@@ -149,7 +198,7 @@ class ProjectStore:
         if project_id in projects:
             del projects[project_id]
             cls.save_projects(projects)
-            proj_dir = STORAGE_DIR / "projects" / project_id
+            proj_dir = cls.project_directory(project_id)
             if proj_dir.exists():
                 shutil.rmtree(proj_dir, ignore_errors=True)
             return True
@@ -176,9 +225,11 @@ class ProjectStore:
         # Clear uploaded T1/T2 datasets
         # --------------------------------------------------------
 
-        for key in ("t1_dir", "t2_dir"):
-            directory = Path(project[key])
-
+        # Resolve all destructive paths from the current storage root. Never
+        # delete using absolute paths persisted by an older installation.
+        project_dir = cls.project_directory(project_id)
+        for time_point in ("t1", "t2"):
+            directory = cls.dataset_directory(project_id, time_point)
             directory.mkdir(parents=True, exist_ok=True)
 
             for item in directory.iterdir():
@@ -250,6 +301,8 @@ class ProjectStore:
                 "status": "CREATED",
                 "datasets_ready": False,
                 "wetland_boundary": None,
+                "t1_dir": str(cls.dataset_directory(project_id, "t1")),
+                "t2_dir": str(cls.dataset_directory(project_id, "t2")),
                 "latest_run_id": None,
                 "preparation_status": "NOT_PREPARED",
                 "is_locked": False,
@@ -275,7 +328,7 @@ class ProjectStore:
             return None
         projects[project_id].update(updates)
         cls.save_projects(projects)
-        return projects[project_id]
+        return cls.normalize_project_paths(projects[project_id])
 
     @classmethod
     def _preparation_file(cls, project_id: str) -> Path:
@@ -326,7 +379,8 @@ class PreparationService:
 
     @staticmethod
     def _find_reference_raster(project: Dict[str, Any]) -> Optional[Path]:
-        t1_dir = Path(project.get("t1_dir", ""))
+        project_id = project.get("id")
+        t1_dir = ProjectStore.dataset_directory(project_id, "t1") if project_id else Path()
         if t1_dir.exists():
             candidates = list(t1_dir.glob("*.tif")) + list(t1_dir.glob("*.TIF"))
             if candidates:
@@ -668,8 +722,8 @@ class RunWorker:
                 except Exception as exc:
                     logger.warning("Failed to write config_overrides snapshot: %s", exc)
 
-            t1_dir = Path(project["t1_dir"])
-            t2_dir = Path(project["t2_dir"])
+            t1_dir = ProjectStore.dataset_directory(project["id"], "t1")
+            t2_dir = ProjectStore.dataset_directory(project["id"], "t2")
             wetland_boundary = project.get("wetland_boundary")
 
             # Determine effective analysis mode from overrides, project, or default to wetland
@@ -1015,7 +1069,7 @@ class TileRenderer:
 
         raster_path = PreparationService._find_reference_raster(project)
         if not raster_path or not raster_path.exists():
-            t2_dir = Path(project.get("t2_dir", ""))
+            t2_dir = ProjectStore.dataset_directory(project_id, "t2")
             if t2_dir.exists():
                 c = list(t2_dir.glob("*.tif")) + list(t2_dir.glob("*.TIF"))
                 if c:

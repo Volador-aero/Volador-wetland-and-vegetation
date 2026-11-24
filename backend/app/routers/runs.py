@@ -18,8 +18,8 @@ def launch_run(payload: RunCreateRequest):
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {payload.project_id} not found")
 
-    t1_dir = Path(project["t1_dir"])
-    t2_dir = Path(project["t2_dir"])
+    t1_dir = ProjectStore.dataset_directory(payload.project_id, "t1")
+    t2_dir = ProjectStore.dataset_directory(payload.project_id, "t2")
     sample_dir = ENGINE_SRC.parent / "data" / "sample_scene"
 
     effective_mode = "wetland"

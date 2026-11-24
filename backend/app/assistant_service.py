@@ -52,7 +52,6 @@ When project context is provided:
 """
 
 
-
 def generate_assistant_response(
     question: str,
     context: dict[str, Any] | None = None,
@@ -67,6 +66,7 @@ def generate_assistant_response(
 
     user_message = f"User question:\n{question}"
 
+    # Add project context only when it is available.
     if context is not None:
         context_json = json.dumps(
             context,
@@ -80,10 +80,11 @@ def generate_assistant_response(
             f"{context_json}"
         )
 
+    # Create the client regardless of whether context exists.
     client = OpenAI(
         api_key=OPENROUTER_API_KEY,
         base_url="https://openrouter.ai/api/v1",
-        timeout=30.0,
+        timeout=60.0,
     )
 
     try:
@@ -100,7 +101,7 @@ def generate_assistant_response(
                 },
             ],
             temperature=0.3,
-            max_tokens=700,
+            max_tokens=1600,
         )
 
         # Check whether OpenRouter returned any choices.
@@ -162,4 +163,5 @@ def generate_assistant_response(
         raise
 
     finally:
+        # Always close the client after the request.
         client.close()

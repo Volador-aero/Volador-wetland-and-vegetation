@@ -33,7 +33,10 @@ def create_project(payload: ProjectCreate):
 @router.get("", response_model=List[Project])
 def list_projects():
     projects = ProjectStore.load_projects()
-    return list(projects.values())
+    return [
+        ProjectStore.normalize_project_paths(project)
+        for project in projects.values()
+    ]
 
 
 @router.get("/{project_id}", response_model=Project)

@@ -526,3 +526,23 @@ export async function sendAssistantMessage(
 
   return res.json();
 }
+
+export interface AssistantStatusResponse {
+  status: "READY" | "NOT_CONFIGURED";
+  configured: boolean;
+  model: string | null;
+  message: string;
+}
+
+export async function getAssistantStatus(): Promise<AssistantStatusResponse> {
+  const res = await fetch(`${API_BASE}/assistant/status`);
+
+  if (!res.ok) {
+    await handleResponseError(
+      res,
+      "Unable to check AI Assistant status."
+    );
+  }
+
+  return res.json();
+}
