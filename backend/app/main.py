@@ -5,6 +5,8 @@ FastAPI Application Entry Point for the GIS Wetland Engine backend.
 """
 
 import sys
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +23,33 @@ if str(ENGINE_SRC) not in sys.path:
 from app.routers import projects, datasets, runs, results, layers, reports
 from app.schemas import APIErrorResponse, ErrorDetail
 
+from concurrent.futures import ThreadPoolExecutor
+from app import services
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # The OS releases this storage-owner lock even after a process is killed.
+    with (services.STORAGE_DIR / ".worker.lock").open("a+b") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError("This storage folder already has an API worker") from exc
+        try:
+            yield
+        finally:
+            services.executor.shutdown(wait=True)
+            services.executor = ThreadPoolExecutor(max_workers=2)
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="GIS Wetland Degradation & Depletion Engine API",
     description="Authoritative API backing the GIS Wetland degradation assessment pipeline.",
     version="1.0.0",

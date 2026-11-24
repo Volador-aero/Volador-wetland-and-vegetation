@@ -23,6 +23,7 @@ import platform
 import sys
 import time
 import uuid
+from threading import get_ident
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -31,6 +32,7 @@ import numpy as np
 import rasterio
 
 from .config import load_config, save_config_snapshot, config_hash
+from .checkpoints import Checkpoints, fields
 from .dispatcher import AnalysisDispatcher
 from .constants import (
     CHANNEL_ORDER,
@@ -69,7 +71,31 @@ def _generate_run_id(user_run_id: Optional[str] = None) -> str:
     return f"{ts}_{short}"
 
 
-def _setup_logging(run_id: str, log_dir: Path, log_level: str = "INFO") -> logging.FileHandler:
+def _prepare_run_directory(run_dir: Path) -> None:
+    """Create a run directory or accept one reserved by durable run state.
+
+    The API writes ``run_state.json`` before background execution begins. A
+    directory containing only that file is a safe reservation. Any other
+    existing content may be output from an earlier run and remains rejected.
+    """
+    if not run_dir.exists():
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return
+
+    entries = list(run_dir.iterdir())
+    is_state_reservation = (
+        len(entries) == 1
+        and entries[0].name == "run_state.json"
+        and entries[0].is_file()
+    )
+    if not is_state_reservation:
+        raise OutputError(
+            f"Run directory already exists: {run_dir}. "
+            "Use a unique run_id or remove the existing directory."
+        )
+
+
+def _setup_logging(run_id: str, log_dir: Path, log_level: str = "INFO"):
     """Configures structured logging for a production run."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "analysis.log"
@@ -77,22 +103,18 @@ def _setup_logging(run_id: str, log_dir: Path, log_level: str = "INFO") -> loggi
     root_logger = logging.getLogger("gis_engine")
     root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
-    # Remove pre-existing handlers to avoid duplication across runs
-    root_logger.handlers.clear()
-
     formatter = logging.Formatter(
         fmt=f"[%(levelname)s] [{run_id}] %(name)s — %(message)s",
     )
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setFormatter(formatter)
-    root_logger.addHandler(fh)
-
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(formatter)
-    root_logger.addHandler(ch)
-
-    return fh
+    handlers = (fh, logging.StreamHandler(sys.__stdout__))
+    owner = get_ident()
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        handler.addFilter(lambda record: record.thread == owner)
+        root_logger.addHandler(handler)
+    return handlers
 
 
 def _file_sha256(path: Path) -> str:
@@ -178,6 +200,9 @@ class ProductionPipeline:
         wetland_boundary: Optional[Union[str, Path]] = None,
         run_id: Optional[str] = None,
         log_level: str = "INFO",
+        checkpoint_signature=None,
+        resume=False,
+        stage_callback=None,
     ) -> AnalysisResult:
         """
         Executes the complete production analysis pipeline.
@@ -192,13 +217,11 @@ class ProductionPipeline:
         output_base_dir = Path(output_base_dir)
         run_dir = output_base_dir / run_id
 
-        if run_dir.exists():
-            raise OutputError(
-                f"Run directory already exists: {run_dir}. "
-                "Use a unique run_id or remove the existing directory."
-            )
-
-        run_dir.mkdir(parents=True, exist_ok=True)
+        if resume:
+            if not checkpoint_signature or not (run_dir / 'checkpoint_manifest.json').is_file():
+                raise OutputError('A committed checkpoint is required to resume')
+        else:
+            _prepare_run_directory(run_dir)
 
         veg_dir     = run_dir / "vegetation"
         change_dir  = run_dir / "change"
@@ -215,9 +238,9 @@ class ProductionPipeline:
                   fusion_dir, metrics_dir, val_dir, reports_dir, logs_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
-        fh = None
+        handlers = ()
         try:
-            fh = _setup_logging(run_id, logs_dir, log_level)
+            handlers = _setup_logging(run_id, logs_dir, log_level)
             run_logger = logging.getLogger("gis_engine.pipeline")
 
             warnings: List[str] = []
@@ -363,6 +386,21 @@ class ProductionPipeline:
             # ==============================================================
             # VEGETATION MODE BRANCH — Single-Date Pipeline Execution
             # ==============================================================
+            store = None
+            if checkpoint_signature:
+                store = Checkpoints(run_dir, dispatcher.analysis_mode, checkpoint_signature,
+                                    resume=resume, notify=stage_callback)
+                if resume:
+                    store.prepare_resume()
+
+            def execute_stage(name, work):
+                if store:
+                    return store.run(name, work, outputs, warnings)
+                if stage_callback:
+                    stage_callback(name)
+                return work()
+
+            execute_stage("INPUT_VALIDATION", lambda: None)
             if dispatcher.is_vegetation:
                 run_logger.info("Step 3 — Vegetation mode: single-date execution (bypassing temporal alignment)")
                 from ..alignment.spatial import ReferenceGrid
@@ -377,293 +415,327 @@ class ProductionPipeline:
                         pass
                 if not t1_paths:
                     raise FileNotFoundError(f"No valid spectral bands found in scene: {t1_scene}")
-                first_band_path = next(iter(t1_paths.values()))
-                with rasterio.open(first_band_path) as src:
-                    ref_grid = ReferenceGrid(
-                        crs=src.crs,
-                        transform=src.transform,
-                        width=src.width,
-                        height=src.height,
-                        resolution=src.res,
-                        bounds=(src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top),
-                    )
-                    h, w = src.height, src.width
-
-                overlap_mask = np.ones((h, w), dtype=bool)
-                effective_overlap_mask = overlap_mask
-                overlap_pixel_count = int(h * w)
-                inclusion_pixel_count = overlap_pixel_count
-                excluded_pixel_count = 0
-                effective_pixel_count = overlap_pixel_count
-                total_overlap_area_ha = None
-                inclusion_area_ha = None
-                excluded_area_ha = None
-                effective_analysis_area_ha = None
-                physical_area_available = False
-                area_basis = "PIXEL_COUNT_ONLY"
-                if ref_grid.crs is not None:
-                    try:
-                        from ..metrics.area import calculate_pixel_areas
-                        pixel_areas = calculate_pixel_areas(
-                            ref_grid.transform,
-                            (ref_grid.height, ref_grid.width),
-                            ref_grid.crs,
+                def run_preprocessing():
+                    first_band_path = next(iter(t1_paths.values()))
+                    with rasterio.open(first_band_path) as src:
+                        ref_grid = ReferenceGrid(
+                            crs=src.crs,
+                            transform=src.transform,
+                            width=src.width,
+                            height=src.height,
+                            resolution=src.res,
+                            bounds=(src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top),
                         )
-                        effective_analysis_area_ha = float(np.sum(pixel_areas)) / 10000.0
-                        total_overlap_area_ha = effective_analysis_area_ha
-                        inclusion_area_ha = effective_analysis_area_ha
-                        excluded_area_ha = 0.0
-                        physical_area_available = True
-                        area_basis = "RASTER_CRS_AND_TRANSFORM"
-                    except Exception:
-                        pass
+                        h, w = src.height, src.width
 
-                band_statistics = {"scene": {}}
-                for b_name in ["green", "red", "rededge", "nir"]:
-                    p = t1_paths.get(b_name)
-                    if p and Path(p).is_file():
-                        with rasterio.open(p) as src:
-                            arr = src.read(1).astype(np.float32)
-                            valid = ~np.isnan(arr) & ~np.isinf(arr) & (arr != (src.nodata or -9999.0))
-                            v = arr[valid]
-                            if v.size > 0:
-                                band_statistics["scene"][b_name] = {
-                                    "valid_count": int(v.size),
-                                    "min": float(np.min(v)),
-                                    "max": float(np.max(v)),
-                                    "mean": float(np.mean(v)),
-                                    "median": float(np.median(v)),
-                                    "std": float(np.std(v)),
-                                    "p95": float(np.percentile(v, 95.0)),
-                                }
+                    overlap_mask = np.ones((h, w), dtype=bool)
+                    effective_overlap_mask = overlap_mask
+                    overlap_pixel_count = int(h * w)
+                    inclusion_pixel_count = overlap_pixel_count
+                    excluded_pixel_count = 0
+                    effective_pixel_count = overlap_pixel_count
+                    total_overlap_area_ha = None
+                    inclusion_area_ha = None
+                    excluded_area_ha = None
+                    effective_analysis_area_ha = None
+                    physical_area_available = False
+                    area_basis = "PIXEL_COUNT_ONLY"
+                    if ref_grid.crs is not None:
+                        try:
+                            from ..metrics.area import calculate_pixel_areas
+                            pixel_areas = calculate_pixel_areas(
+                                ref_grid.transform,
+                                (ref_grid.height, ref_grid.width),
+                                ref_grid.crs,
+                            )
+                            effective_analysis_area_ha = float(np.sum(pixel_areas)) / 10000.0
+                            total_overlap_area_ha = effective_analysis_area_ha
+                            inclusion_area_ha = effective_analysis_area_ha
+                            excluded_area_ha = 0.0
+                            physical_area_available = True
+                            area_basis = "RASTER_CRS_AND_TRANSFORM"
+                        except Exception:
+                            pass
 
-                # Step 4 — Run Single-Date Vegetation Analysis
-                run_logger.info("Steps 4–7 — Vegetation analysis (single-date)")
-                try:
-                    from ..vegetation.pipeline import VegetationAnalysisPipeline
-                    veg_pipeline = VegetationAnalysisPipeline()
-                    veg_result = veg_pipeline.run(
-                        scene_dir=t1_scene,
-                        model_path=model_path,
-                        veg_dir=veg_dir,
-                        config=config,
-                        run_logger=run_logger,
+                    band_statistics = {"scene": {}}
+                    for b_name in ["green", "red", "rededge", "nir"]:
+                        p = t1_paths.get(b_name)
+                        if p and Path(p).is_file():
+                            with rasterio.open(p) as src:
+                                arr = src.read(1).astype(np.float32)
+                                valid = ~np.isnan(arr) & ~np.isinf(arr) & (arr != (src.nodata or -9999.0))
+                                v = arr[valid]
+                                if v.size > 0:
+                                    band_statistics["scene"][b_name] = {
+                                        "valid_count": int(v.size),
+                                        "min": float(np.min(v)),
+                                        "max": float(np.max(v)),
+                                        "mean": float(np.mean(v)),
+                                        "median": float(np.median(v)),
+                                        "std": float(np.std(v)),
+                                        "p95": float(np.percentile(v, 95.0)),
+                                    }
+                    return (
+                        ref_grid, band_statistics, total_overlap_area_ha,
+                        effective_analysis_area_ha, physical_area_available, area_basis,
+                        effective_pixel_count, overlap_pixel_count, excluded_pixel_count,
+                        inclusion_pixel_count,
                     )
-                except Exception as exc:
-                    raise GISProcessingError(f"Vegetation analysis failed: {exc}") from exc
 
-                outputs["vegetation/health.tif"] = "vegetation/health.tif"
-                outputs["vegetation/confidence.tif"] = "vegetation/confidence.tif"
-                outputs["vegetation/statistics.json"] = "vegetation/statistics.json"
+                (
+                    ref_grid, band_statistics, total_overlap_area_ha,
+                    effective_analysis_area_ha, physical_area_available, area_basis,
+                    effective_pixel_count, overlap_pixel_count, excluded_pixel_count,
+                    inclusion_pixel_count,
+                ) = execute_stage(
+                    "PREPROCESSING", run_preprocessing)
 
-                # Spectral indices on single scene
-                eps = 1e-7
-                index_stats = {}
-                nir_p = t1_paths.get("nir")
-                red_p = t1_paths.get("red")
-                green_p = t1_paths.get("green")
-                re_p = t1_paths.get("rededge")
+                def run_vegetation_inference():
+                    # Step 4 — Run Single-Date Vegetation Analysis
+                    run_logger.info("Steps 4–7 — Vegetation analysis (single-date)")
+                    try:
+                        from ..vegetation.pipeline import VegetationAnalysisPipeline
+                        veg_pipeline = VegetationAnalysisPipeline()
+                        veg_result = veg_pipeline.run(
+                            scene_dir=t1_scene,
+                            model_path=model_path,
+                            veg_dir=veg_dir,
+                            config=config,
+                            run_logger=run_logger,
+                        )
+                    except Exception as exc:
+                        raise GISProcessingError(f"Vegetation analysis failed: {exc}") from exc
 
-                def _calc_s_idx(arr: np.ndarray, formula_str: str) -> Dict[str, Any]:
-                    v = arr[~np.isnan(arr) & ~np.isinf(arr)]
-                    return {
-                        "formula": formula_str,
-                        "mean": float(np.mean(v)) if v.size else 0.0,
-                        "median": float(np.median(v)) if v.size else 0.0,
-                        "std": float(np.std(v)) if v.size else 0.0,
-                        "p95": float(np.percentile(v, 95.0)) if v.size else 0.0,
+                    outputs["vegetation/health.tif"] = "vegetation/health.tif"
+                    outputs["vegetation/confidence.tif"] = "vegetation/confidence.tif"
+                    outputs["vegetation/statistics.json"] = "vegetation/statistics.json"
+
+                    veg_result = fields(veg_result, "class_statistics", "performance", "confidence", "valid_mask")
+                    return (veg_result,)
+
+                (veg_result,) = execute_stage(
+                    "VEGETATION_INFERENCE", run_vegetation_inference)
+
+                def run_metrics_qa():
+                    qa_dict = {"overall_status": "PASS", "flags": []}
+                    # Spectral indices on single scene
+                    eps = 1e-7
+                    index_stats = {}
+                    nir_p = t1_paths.get("nir")
+                    red_p = t1_paths.get("red")
+                    green_p = t1_paths.get("green")
+                    re_p = t1_paths.get("rededge")
+
+                    def _calc_s_idx(arr: np.ndarray, formula_str: str) -> Dict[str, Any]:
+                        v = arr[~np.isnan(arr) & ~np.isinf(arr)]
+                        return {
+                            "formula": formula_str,
+                            "mean": float(np.mean(v)) if v.size else 0.0,
+                            "median": float(np.median(v)) if v.size else 0.0,
+                            "std": float(np.std(v)) if v.size else 0.0,
+                            "p95": float(np.percentile(v, 95.0)) if v.size else 0.0,
+                        }
+
+                    if nir_p and red_p:
+                        with rasterio.open(nir_p) as s_nir, rasterio.open(red_p) as s_red:
+                            n_arr = s_nir.read(1).astype(np.float32)
+                            r_arr = s_red.read(1).astype(np.float32)
+                            ndvi = (n_arr - r_arr) / (n_arr + r_arr + eps)
+                            index_stats["ndvi"] = _calc_s_idx(ndvi, "(NIR - Red) / (NIR + Red)")
+
+                    if nir_p and green_p:
+                        with rasterio.open(nir_p) as s_nir, rasterio.open(green_p) as s_green:
+                            n_arr = s_nir.read(1).astype(np.float32)
+                            g_arr = s_green.read(1).astype(np.float32)
+                            gndvi = (n_arr - g_arr) / (n_arr + g_arr + eps)
+                            index_stats["gndvi"] = _calc_s_idx(gndvi, "(NIR - Green) / (NIR + Green)")
+
+                    if nir_p and re_p:
+                        with rasterio.open(nir_p) as s_nir, rasterio.open(re_p) as s_re:
+                            n_arr = s_nir.read(1).astype(np.float32)
+                            re_arr = s_re.read(1).astype(np.float32)
+                            ndre = (n_arr - re_arr) / (n_arr + re_arr + eps)
+                            index_stats["ndre"] = _calc_s_idx(ndre, "(NIR - RedEdge) / (NIR + RedEdge)")
+
+                    # Single-date QA
+                    try:
+                        from ..validation.quality import QualityAssuranceEngine
+                        qa_engine = QualityAssuranceEngine(config)
+                        qa_engine.run_uncertainty_qa(config, reference_samples_exist=False)
+                        qa_dict = qa_engine.generate_qa_report()
+                        _write_json(val_dir / "qa_report.json", qa_dict)
+                        outputs["validation/qa_report.json"] = "validation/qa_report.json"
+                    except Exception as exc:
+                        warnings.append(f"QA: {exc}")
+                        run_logger.warning("Step 12 — QA issue: %s", exc)
+
+                    total_runtime = time.perf_counter() - run_start
+
+                    veg_classes = veg_result.class_statistics.get("classes", {})
+                    healthy_pct = veg_classes.get("3", {}).get("percentage", 0.0)
+                    moderate_pct = veg_classes.get("2", {}).get("percentage", 0.0)
+                    severe_pct = veg_classes.get("1", {}).get("percentage", 0.0)
+                    background_pct = veg_classes.get("0", {}).get("percentage", 0.0)
+                    veg_coverage_pct = healthy_pct + moderate_pct + severe_pct
+
+                    mean_conf = float(np.nanmean(veg_result.confidence[veg_result.valid_mask])) if np.any(veg_result.valid_mask) else 0.0
+
+                    result_content = {
+                        "run_id": run_id,
+                        "software_version": SOFTWARE_VERSION,
+                        "analysis_mode": "vegetation",
+                        "status": "WARNING" if warnings else "SUCCESS",
+                        "inputs": {
+                            "scene_path": str(t1_scene),
+                            "model_path": str(model_path),
+                            "band_statistics": band_statistics,
+                        },
+                        "temporal": {
+                            "date": t1_date,
+                        },
+                        "spectral_indices": index_stats,
+                        "spatial": {
+                            "crs": str(ref_grid.crs) if ref_grid and ref_grid.crs is not None else None,
+                            "dimensions": [ref_grid.height, ref_grid.width],
+                            "resolution": list(ref_grid.resolution),
+                            "extent": list(ref_grid.bounds),
+                            "total_area_ha": total_overlap_area_ha,
+                            "effective_analysis_area_ha": effective_analysis_area_ha,
+                            "physical_area_available": physical_area_available,
+                            "area_basis": area_basis,
+                            "total_pixels": int(ref_grid.width * ref_grid.height),
+                            "valid_pixels": int(veg_result.class_statistics.get("total_valid_pixels", 0)),
+                        },
+                        "vegetation": veg_result.class_statistics,
+                        "metrics": {
+                            "class_distribution": veg_result.class_statistics,
+                            "healthy_vegetation_percentage": healthy_pct,
+                            "moderate_stress_percentage": moderate_pct,
+                            "severe_stress_percentage": severe_pct,
+                            "background_percentage": background_pct,
+                            "vegetation_coverage_percentage": veg_coverage_pct,
+                            "mean_confidence": mean_conf,
+                            "analysis_extent": {
+                                "valid_analysis_area_ha": effective_analysis_area_ha or 0.0,
+                            },
+                        },
+                        "validation": qa_dict,
+                        "uncertainty": {
+                            "mean_confidence": mean_conf,
+                        },
+                        "warnings": warnings,
+                        "errors": errors,
+                        "outputs": outputs,
+                        "performance": {
+                            "total_runtime_seconds": total_runtime,
+                            "inference": veg_result.performance,
+                        },
                     }
 
-                if nir_p and red_p:
-                    with rasterio.open(nir_p) as s_nir, rasterio.open(red_p) as s_red:
-                        n_arr = s_nir.read(1).astype(np.float32)
-                        r_arr = s_red.read(1).astype(np.float32)
-                        ndvi = (n_arr - r_arr) / (n_arr + r_arr + eps)
-                        index_stats["ndvi"] = _calc_s_idx(ndvi, "(NIR - Red) / (NIR + Red)")
+                    _write_json(run_dir / "analysis_result.json", result_content)
+                    outputs["analysis_result.json"] = "analysis_result.json"
+                    return (result_content, qa_dict,)
 
-                if nir_p and green_p:
-                    with rasterio.open(nir_p) as s_nir, rasterio.open(green_p) as s_green:
-                        n_arr = s_nir.read(1).astype(np.float32)
-                        g_arr = s_green.read(1).astype(np.float32)
-                        gndvi = (n_arr - g_arr) / (n_arr + g_arr + eps)
-                        index_stats["gndvi"] = _calc_s_idx(gndvi, "(NIR - Green) / (NIR + Green)")
+                (result_content, qa_dict,) = execute_stage(
+                    "METRICS_QA", run_metrics_qa)
 
-                if nir_p and re_p:
-                    with rasterio.open(nir_p) as s_nir, rasterio.open(re_p) as s_re:
-                        n_arr = s_nir.read(1).astype(np.float32)
-                        re_arr = s_re.read(1).astype(np.float32)
-                        ndre = (n_arr - re_arr) / (n_arr + re_arr + eps)
-                        index_stats["ndre"] = _calc_s_idx(ndre, "(NIR - RedEdge) / (NIR + RedEdge)")
+                def run_reporting():
+                    # Step 14 — Reports (Vegetation Health Markdown, Maps & PDF)
+                    run_logger.info("Step 14 — Generating vegetation analysis reports")
+                    try:
+                        from ..output.report import generate_analysis_report
+                        generate_analysis_report(
+                            result_dict=result_content,
+                            output_path=reports_dir / "analysis_report.md",
+                            run_id=run_id,
+                        )
+                        outputs["reports/analysis_report.md"] = "reports/analysis_report.md"
+                    except Exception as exc:
+                        warnings.append(f"Markdown Report: {exc}")
+                        run_logger.warning("Step 14 — Markdown report warning: %s", exc)
 
-                # Single-date QA
-                try:
-                    from ..validation.quality import QualityAssuranceEngine
-                    qa_engine = QualityAssuranceEngine(config)
-                    qa_engine.run_uncertainty_qa(config, reference_samples_exist=False)
-                    qa_dict = qa_engine.generate_qa_report()
-                    _write_json(val_dir / "qa_report.json", qa_dict)
-                    outputs["validation/qa_report.json"] = "validation/qa_report.json"
-                except Exception as exc:
-                    warnings.append(f"QA: {exc}")
-                    run_logger.warning("Step 12 — QA issue: %s", exc)
+                    map_assets = {}
+                    try:
+                        from ..output.cartography import generate_report_maps
+                        map_assets = generate_report_maps(
+                            run_dir=run_dir,
+                            figures_dir=reports_dir / "figures",
+                        )
+                        for fig_key, fig_path in map_assets.items():
+                            rel_fig = str(fig_path.relative_to(run_dir)).replace("\\", "/")
+                            outputs[f"reports/figures/{fig_path.name}"] = rel_fig
+                    except Exception as exc:
+                        warnings.append(f"Map Rendering: {exc}")
+                        run_logger.warning("Step 14 — Map rendering warning: %s", exc)
 
-                total_runtime = time.perf_counter() - run_start
+                    try:
+                        from ..output.pdf import generate_all_reports
+                        generated_pdfs = generate_all_reports(
+                            result_dict=result_content,
+                            run_dir=run_dir,
+                            reports_dir=reports_dir,
+                            map_assets=map_assets,
+                            run_id=run_id,
+                        )
+                        # Register all generated PDFs in the output manifest
+                        for pdf_key, pdf_path in generated_pdfs.items():
+                            rel = str(pdf_path.relative_to(run_dir)).replace("\\", "/")
+                            outputs[rel] = rel
+                    except Exception as exc:
+                        warnings.append(f"PDF Report: {exc}")
+                        run_logger.warning("Step 14 — PDF report warning: %s", exc)
 
-                veg_classes = veg_result.class_statistics.get("classes", {})
-                healthy_pct = veg_classes.get("3", {}).get("percentage", 0.0)
-                moderate_pct = veg_classes.get("2", {}).get("percentage", 0.0)
-                severe_pct = veg_classes.get("1", {}).get("percentage", 0.0)
-                background_pct = veg_classes.get("0", {}).get("percentage", 0.0)
-                veg_coverage_pct = healthy_pct + moderate_pct + severe_pct
+                    # Provenance metadata.json & manifest
+                    model_sha256 = _file_sha256(model_path)
+                    try:
+                        import subprocess
+                        git_commit = subprocess.check_output(
+                            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+                        ).decode().strip()
+                    except Exception:
+                        git_commit = "unavailable"
 
-                mean_conf = float(np.nanmean(veg_result.confidence[veg_result.valid_mask])) if np.any(veg_result.valid_mask) else 0.0
-
-                result_content = {
-                    "run_id": run_id,
-                    "software_version": SOFTWARE_VERSION,
-                    "analysis_mode": "vegetation",
-                    "status": "WARNING" if warnings else "SUCCESS",
-                    "inputs": {
-                        "scene_path": str(t1_scene),
+                    metadata = {
+                        "run_id": run_id,
+                        "software_version": SOFTWARE_VERSION,
+                        "analysis_mode": "vegetation",
+                        "git_commit": git_commit,
+                        "execution_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "python_version": sys.version,
+                        "os": platform.platform(),
                         "model_path": str(model_path),
-                        "band_statistics": band_statistics,
-                    },
-                    "temporal": {
+                        "model_sha256": model_sha256,
+                        "configuration_hash": cfg_hash,
+                        "config_snapshot": str(config_snapshot_path),
+                        "input_scene": _file_fingerprint(t1_scene),
                         "date": t1_date,
-                    },
-                    "spectral_indices": index_stats,
-                    "spatial": {
                         "crs": str(ref_grid.crs) if ref_grid and ref_grid.crs is not None else None,
-                        "dimensions": [ref_grid.height, ref_grid.width],
-                        "resolution": list(ref_grid.resolution),
-                        "extent": list(ref_grid.bounds),
-                        "total_area_ha": total_overlap_area_ha,
-                        "effective_analysis_area_ha": effective_analysis_area_ha,
-                        "physical_area_available": physical_area_available,
-                        "area_basis": area_basis,
-                        "total_pixels": int(ref_grid.width * ref_grid.height),
-                        "valid_pixels": int(veg_result.class_statistics.get("total_valid_pixels", 0)),
-                    },
-                    "vegetation": veg_result.class_statistics,
-                    "metrics": {
-                        "class_distribution": veg_result.class_statistics,
-                        "healthy_vegetation_percentage": healthy_pct,
-                        "moderate_stress_percentage": moderate_pct,
-                        "severe_stress_percentage": severe_pct,
-                        "background_percentage": background_pct,
-                        "vegetation_coverage_percentage": veg_coverage_pct,
-                        "mean_confidence": mean_conf,
-                        "analysis_extent": {
-                            "valid_analysis_area_ha": effective_analysis_area_ha or 0.0,
-                        },
-                    },
-                    "validation": qa_dict,
-                    "uncertainty": {
-                        "mean_confidence": mean_conf,
-                    },
-                    "warnings": warnings,
-                    "errors": errors,
-                    "outputs": outputs,
-                    "performance": {
-                        "total_runtime_seconds": total_runtime,
-                        "inference": veg_result.performance,
-                    },
-                }
+                        "resolution": list(ref_grid.resolution) if ref_grid else None,
+                        "dimensions": [ref_grid.height, ref_grid.width] if ref_grid else None,
+                        "total_runtime_seconds": time.perf_counter() - run_start,
+                    }
+                    _write_json(run_dir / "metadata.json", metadata)
+                    outputs["metadata.json"] = "metadata.json"
 
-                _write_json(run_dir / "analysis_result.json", result_content)
-                outputs["analysis_result.json"] = "analysis_result.json"
+                    manifest = {
+                        "run_id": run_id,
+                        "generated_utc": datetime.now(timezone.utc).isoformat(),
+                        "total_outputs": len(outputs),
+                        "outputs": [_output_entry(run_dir, rel) for rel in outputs.values()],
+                    }
+                    _write_json(run_dir / "manifest.json", manifest)
+                    outputs["manifest.json"] = "manifest.json"
 
-                # Step 14 — Reports (Vegetation Health Markdown, Maps & PDF)
-                run_logger.info("Step 14 — Generating vegetation analysis reports")
-                try:
-                    from ..output.report import generate_analysis_report
-                    generate_analysis_report(
-                        result_dict=result_content,
-                        output_path=reports_dir / "analysis_report.md",
-                        run_id=run_id,
+                    final_status = "WARNING" if warnings else "SUCCESS"
+                    run_logger.info(
+                        "Phase 13 — Vegetation Pipeline COMPLETE. status=%s run_id=%s runtime=%.1fs",
+                        final_status, run_id, time.perf_counter() - run_start,
                     )
-                    outputs["reports/analysis_report.md"] = "reports/analysis_report.md"
-                except Exception as exc:
-                    warnings.append(f"Markdown Report: {exc}")
-                    run_logger.warning("Step 14 — Markdown report warning: %s", exc)
 
-                map_assets = {}
-                try:
-                    from ..output.cartography import generate_report_maps
-                    map_assets = generate_report_maps(
-                        run_dir=run_dir,
-                        figures_dir=reports_dir / "figures",
-                    )
-                    for fig_key, fig_path in map_assets.items():
-                        rel_fig = str(fig_path.relative_to(run_dir)).replace("\\", "/")
-                        outputs[f"reports/figures/{fig_path.name}"] = rel_fig
-                except Exception as exc:
-                    warnings.append(f"Map Rendering: {exc}")
-                    run_logger.warning("Step 14 — Map rendering warning: %s", exc)
+                    return (final_status, metadata,)
 
-                try:
-                    from ..output.pdf import generate_all_reports
-                    generated_pdfs = generate_all_reports(
-                        result_dict=result_content,
-                        run_dir=run_dir,
-                        reports_dir=reports_dir,
-                        map_assets=map_assets,
-                        run_id=run_id,
-                    )
-                    # Register all generated PDFs in the output manifest
-                    for pdf_key, pdf_path in generated_pdfs.items():
-                        rel = str(pdf_path.relative_to(run_dir)).replace("\\", "/")
-                        outputs[rel] = rel
-                except Exception as exc:
-                    warnings.append(f"PDF Report: {exc}")
-                    run_logger.warning("Step 14 — PDF report warning: %s", exc)
-
-                # Provenance metadata.json & manifest
-                model_sha256 = _file_sha256(model_path)
-                try:
-                    import subprocess
-                    git_commit = subprocess.check_output(
-                        ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
-                    ).decode().strip()
-                except Exception:
-                    git_commit = "unavailable"
-
-                metadata = {
-                    "run_id": run_id,
-                    "software_version": SOFTWARE_VERSION,
-                    "analysis_mode": "vegetation",
-                    "git_commit": git_commit,
-                    "execution_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "python_version": sys.version,
-                    "os": platform.platform(),
-                    "model_path": str(model_path),
-                    "model_sha256": model_sha256,
-                    "configuration_hash": cfg_hash,
-                    "config_snapshot": str(config_snapshot_path),
-                    "input_scene": _file_fingerprint(t1_scene),
-                    "date": t1_date,
-                    "crs": str(ref_grid.crs) if ref_grid and ref_grid.crs is not None else None,
-                    "resolution": list(ref_grid.resolution) if ref_grid else None,
-                    "dimensions": [ref_grid.height, ref_grid.width] if ref_grid else None,
-                    "total_runtime_seconds": time.perf_counter() - run_start,
-                }
-                _write_json(run_dir / "metadata.json", metadata)
-                outputs["metadata.json"] = "metadata.json"
-
-                manifest = {
-                    "run_id": run_id,
-                    "generated_utc": datetime.now(timezone.utc).isoformat(),
-                    "total_outputs": len(outputs),
-                    "outputs": [_output_entry(run_dir, rel) for rel in outputs.values()],
-                }
-                _write_json(run_dir / "manifest.json", manifest)
-                outputs["manifest.json"] = "manifest.json"
-
-                final_status = "WARNING" if warnings else "SUCCESS"
-                run_logger.info(
-                    "Phase 13 — Vegetation Pipeline COMPLETE. status=%s run_id=%s runtime=%.1fs",
-                    final_status, run_id, time.perf_counter() - run_start,
-                )
+                (final_status, metadata,) = execute_stage(
+                    "REPORTING", run_reporting)
 
                 return AnalysisResult(
                     run_id=run_id,
@@ -676,343 +748,354 @@ class ProductionPipeline:
                     errors=errors,
                     metadata=metadata,
                 )
-
-            # ==============================================================
-            # STEP 3 — Spatial / Temporal Alignment (Wetland Mode)
-            # ==============================================================
-            run_logger.info("Step 3 — Spatial/temporal alignment")
-            try:
-                from ..alignment.temporal import TemporalAligner
-                aligner = TemporalAligner(config)
-                aligned_pair = aligner.align_pair(t1_scene, t1_date, t2_scene, t2_date)
-            except Exception as exc:
-                raise AlignmentError(f"Alignment failed: {exc}") from exc
-
-            ref_grid     = aligned_pair.reference_grid
-            overlap_mask = aligned_pair.overlap_mask          # bool ndarray (H, W)
-            run_logger.info(
-                "Step 3 — Alignment complete. overlap=%.2f%%",
-                aligned_pair.overlap_percentage,
-            )
-
-            # Create alignment output directories
-            alignment_dir = run_dir / "alignment"
-            t1_aligned_out = alignment_dir / "t1_aligned"
-            t2_aligned_out = alignment_dir / "t2_aligned"
-            t1_aligned_out.mkdir(parents=True, exist_ok=True)
-            t2_aligned_out.mkdir(parents=True, exist_ok=True)
-
-            # Write aligned bands to disk as green.tif, red.tif, rededge.tif, nir.tif
-            align_profile = {
-                "driver": "GTiff",
-                "dtype": "float32",
-                "nodata": NODATA_CONTINUOUS,
-                "width": ref_grid.width,
-                "height": ref_grid.height,
-                "count": 1,
-                "crs": ref_grid.crs,
-                "transform": ref_grid.transform,
-                "compress": "lzw",
-            }
-
-            for band_name, band_arr in aligned_pair.t1_data.items():
-                with rasterio.open(t1_aligned_out / f"{band_name}.tif", "w", **align_profile) as dst:
-                    dst.write(band_arr.astype(np.float32), 1)
-
-            for band_name, band_arr in aligned_pair.t2_data.items():
-                with rasterio.open(t2_aligned_out / f"{band_name}.tif", "w", **align_profile) as dst:
-                    dst.write(band_arr.astype(np.float32), 1)
-
-            # Write overlap mask to alignment folder
-            mask_profile = {
-                "driver": "GTiff",
-                "dtype": "uint8",
-                "nodata": 0,
-                "width": ref_grid.width,
-                "height": ref_grid.height,
-                "count": 1,
-                "crs": ref_grid.crs,
-                "transform": ref_grid.transform,
-                "compress": "lzw",
-            }
-            with rasterio.open(alignment_dir / "overlap_mask.tif", "w", **mask_profile) as dst:
-                dst.write(overlap_mask.astype(np.uint8), 1)
-
-            # Record outputs
-            outputs["alignment/t1_aligned/green.tif"] = "alignment/t1_aligned/green.tif"
-            outputs["alignment/t1_aligned/red.tif"] = "alignment/t1_aligned/red.tif"
-            outputs["alignment/t1_aligned/rededge.tif"] = "alignment/t1_aligned/rededge.tif"
-            outputs["alignment/t1_aligned/nir.tif"] = "alignment/t1_aligned/nir.tif"
-            outputs["alignment/t2_aligned/green.tif"] = "alignment/t2_aligned/green.tif"
-            outputs["alignment/t2_aligned/red.tif"] = "alignment/t2_aligned/red.tif"
-            outputs["alignment/t2_aligned/rededge.tif"] = "alignment/t2_aligned/rededge.tif"
-            outputs["alignment/t2_aligned/nir.tif"] = "alignment/t2_aligned/nir.tif"
-            outputs["alignment/overlap_mask.tif"] = "alignment/overlap_mask.tif"
-
-            # ==============================================================
-            # STEP 3A — Preparation Masking (Inclusion AOI & Manual Exclusions)
-            # ==============================================================
-            run_logger.info("Step 3A — Building authoritative preparation mask")
-
-            try:
-                from ..wetland.exclusion import build_manual_exclusion_mask, build_inclusion_mask
-
-                inclusion_geometry = config.get("inclusion_geometry")
-                manual_exclusions = config.get("manual_exclusions", [])
-
-                exclusion_dir = run_dir / "exclusions"
-                exclusion_dir.mkdir(parents=True, exist_ok=True)
-
-                inclusion_mask_path = (
-                    exclusion_dir / "inclusion_mask.tif"
-                )
-                manual_exclusion_mask_path = (
-                    exclusion_dir / "manual_exclusion_mask.tif"
-                )
-
-                run_logger.info(
-                    "[EXCLUSION TRACE] reference grid: "
-                    f"crs={ref_grid.crs}, "
-                    f"transform={ref_grid.transform}, "
-                    f"width={ref_grid.width}, "
-                    f"height={ref_grid.height}, "
-                    f"bounds={ref_grid.bounds}"
-                )
-
-                run_logger.info(
-                    "[EXCLUSION TRACE] inclusion geometry: "
-                    f"{'Provided' if inclusion_geometry else 'Full Grid'}"
-                )
-                run_logger.info(
-                    "[EXCLUSION TRACE] manual exclusions: "
-                    f"{len(manual_exclusions)} exclusions"
-                )
-
-                # 1. Build inclusion mask (1 = inside AOI, 0 = outside)
-                inclusion_mask = build_inclusion_mask(
-                    geometry=inclusion_geometry,
-                    reference_grid=ref_grid,
-                    output_path=inclusion_mask_path,
-                )
-
-                # 2. Build manual exclusion mask (1 = excluded, 0 = not excluded)
-                manual_exclusion_mask = build_manual_exclusion_mask(
-                    exclusions=manual_exclusions,
-                    reference_grid=ref_grid,
-                    output_path=manual_exclusion_mask_path,
-                )
-
-                # 3. Form authoritative effective analysis mask:
-                # effective = overlap & inclusion & ~exclusion
-                effective_overlap_mask = (
-                    overlap_mask.astype(bool)
-                    & inclusion_mask.astype(bool)
-                    & ~manual_exclusion_mask.astype(bool)
-                )
-
-                overlap_pixel_count = int(
-                    np.sum(overlap_mask.astype(bool))
-                )
-
-                inclusion_pixel_count = int(
-                    np.sum(
-                        overlap_mask.astype(bool)
-                        & inclusion_mask.astype(bool)
-                    )
-                )
-
-                excluded_pixel_count = int(
-                    np.sum(
-                        overlap_mask.astype(bool)
-                        & inclusion_mask.astype(bool)
-                        & manual_exclusion_mask.astype(bool)
-                    )
-                )
-
-                effective_pixel_count = int(
-                    np.sum(effective_overlap_mask)
-                )
-
-                outputs[
-                    "exclusions/inclusion_mask.tif"
-                ] = "exclusions/inclusion_mask.tif"
-                outputs[
-                    "exclusions/manual_exclusion_mask.tif"
-                ] = "exclusions/manual_exclusion_mask.tif"
-
-                # Physical hectare areas are only authoritative when the
-                # analysis grid is georeferenced. For the current pixel-space
-                # DJI test imagery (CRS=None + identity transform), pixel counts
-                # remain authoritative and physical area is explicitly unavailable.
-                total_overlap_area_ha = None
-                inclusion_area_ha = None
-                excluded_area_ha = None
-                effective_analysis_area_ha = None
-                physical_area_available = False
-                area_basis = "PIXEL_COUNT_ONLY"
-
+            def run_alignment():
+                # ==============================================================
+                # STEP 3 — Spatial / Temporal Alignment (Wetland Mode)
+                # ==============================================================
+                run_logger.info("Step 3 — Spatial/temporal alignment")
                 try:
-                    if ref_grid.crs is not None:
-                        from ..metrics.area import calculate_pixel_areas
-
-                        pixel_areas = calculate_pixel_areas(
-                            ref_grid.transform,
-                            (ref_grid.height, ref_grid.width),
-                            ref_grid.crs,
-                        )
-
-                        total_overlap_area_ha = float(
-                            np.sum(
-                                pixel_areas[
-                                    overlap_mask.astype(bool)
-                                ]
-                            )
-                        ) / 10000.0
-
-                        inclusion_area_ha = float(
-                            np.sum(
-                                pixel_areas[
-                                    overlap_mask.astype(bool)
-                                    & inclusion_mask.astype(bool)
-                                ]
-                            )
-                        ) / 10000.0
-
-                        excluded_area_ha = float(
-                            np.sum(
-                                pixel_areas[
-                                    overlap_mask.astype(bool)
-                                    & inclusion_mask.astype(bool)
-                                    & manual_exclusion_mask.astype(bool)
-                                ]
-                            )
-                        ) / 10000.0
-
-                        effective_analysis_area_ha = float(
-                            np.sum(
-                                pixel_areas[
-                                    effective_overlap_mask
-                                ]
-                            )
-                        ) / 10000.0
-
-                        physical_area_available = True
-                        area_basis = "RASTER_CRS_AND_TRANSFORM"
-                    else:
-                        run_logger.warning(
-                            "Step 3A — Physical area unavailable: analysis grid "
-                            "has no CRS. Reporting pixel counts only."
-                        )
+                    from ..alignment.temporal import TemporalAligner
+                    aligner = TemporalAligner(config)
+                    aligned_pair = aligner.align_pair(t1_scene, t1_date, t2_scene, t2_date)
                 except Exception as exc:
-                    run_logger.warning(
-                        "Failed to calculate physical exclusion areas: %s",
-                        exc,
-                    )
+                    raise AlignmentError(f"Alignment failed: {exc}") from exc
 
-                if physical_area_available:
-                    run_logger.info(
-                        "Step 3A — Analysis footprint: total_overlap=%.4f ha, "
-                        "inclusion=%.4f ha, excluded=%.4f ha, effective=%.4f ha",
-                        total_overlap_area_ha,
-                        inclusion_area_ha,
-                        excluded_area_ha,
-                        effective_analysis_area_ha,
-                    )
-                else:
-                    run_logger.info(
-                        "Step 3A — Analysis footprint: total_overlap_pixels=%d, "
-                        "inclusion_pixels=%d, excluded_pixels=%d, effective_pixels=%d; "
-                        "physical area unavailable.",
-                        overlap_pixel_count,
-                        inclusion_pixel_count,
-                        excluded_pixel_count,
-                        effective_pixel_count,
-                    )
-                # Preserve the original alignment footprint separately from the
-                # effective analysis footprint after manual exclusions.
-                effective_mask_path = alignment_dir / "effective_analysis_mask.tif"
+                ref_grid     = aligned_pair.reference_grid
+                overlap_mask = aligned_pair.overlap_mask          # bool ndarray (H, W)
+                run_logger.info(
+                    "Step 3 — Alignment complete. overlap=%.2f%%",
+                    aligned_pair.overlap_percentage,
+                )
 
-                effective_mask_profile = {
+                # Create alignment output directories
+                alignment_dir = run_dir / "alignment"
+                t1_aligned_out = alignment_dir / "t1_aligned"
+                t2_aligned_out = alignment_dir / "t2_aligned"
+                t1_aligned_out.mkdir(parents=True, exist_ok=True)
+                t2_aligned_out.mkdir(parents=True, exist_ok=True)
+
+                # Write aligned bands to disk as green.tif, red.tif, rededge.tif, nir.tif
+                align_profile = {
                     "driver": "GTiff",
-                    "height": int(ref_grid.height),
-                    "width": int(ref_grid.width),
+                    "dtype": "float32",
+                    "nodata": NODATA_CONTINUOUS,
+                    "width": ref_grid.width,
+                    "height": ref_grid.height,
                     "count": 1,
-                    "dtype": "uint8",
                     "crs": ref_grid.crs,
                     "transform": ref_grid.transform,
-                    "nodata": 0,
                     "compress": "lzw",
                 }
 
-                with rasterio.open(
-                    effective_mask_path,
-                    "w",
-                    **effective_mask_profile,
-                ) as dst:
-                    dst.write(
-                        effective_overlap_mask.astype(np.uint8),
-                        1,
+                for band_name, band_arr in aligned_pair.t1_data.items():
+                    with rasterio.open(t1_aligned_out / f"{band_name}.tif", "w", **align_profile) as dst:
+                        dst.write(band_arr.astype(np.float32), 1)
+
+                for band_name, band_arr in aligned_pair.t2_data.items():
+                    with rasterio.open(t2_aligned_out / f"{band_name}.tif", "w", **align_profile) as dst:
+                        dst.write(band_arr.astype(np.float32), 1)
+
+                # Write overlap mask to alignment folder
+                mask_profile = {
+                    "driver": "GTiff",
+                    "dtype": "uint8",
+                    "nodata": 0,
+                    "width": ref_grid.width,
+                    "height": ref_grid.height,
+                    "count": 1,
+                    "crs": ref_grid.crs,
+                    "transform": ref_grid.transform,
+                    "compress": "lzw",
+                }
+                with rasterio.open(alignment_dir / "overlap_mask.tif", "w", **mask_profile) as dst:
+                    dst.write(overlap_mask.astype(np.uint8), 1)
+
+                # Record outputs
+                outputs["alignment/t1_aligned/green.tif"] = "alignment/t1_aligned/green.tif"
+                outputs["alignment/t1_aligned/red.tif"] = "alignment/t1_aligned/red.tif"
+                outputs["alignment/t1_aligned/rededge.tif"] = "alignment/t1_aligned/rededge.tif"
+                outputs["alignment/t1_aligned/nir.tif"] = "alignment/t1_aligned/nir.tif"
+                outputs["alignment/t2_aligned/green.tif"] = "alignment/t2_aligned/green.tif"
+                outputs["alignment/t2_aligned/red.tif"] = "alignment/t2_aligned/red.tif"
+                outputs["alignment/t2_aligned/rededge.tif"] = "alignment/t2_aligned/rededge.tif"
+                outputs["alignment/t2_aligned/nir.tif"] = "alignment/t2_aligned/nir.tif"
+                outputs["alignment/overlap_mask.tif"] = "alignment/overlap_mask.tif"
+
+                # ==============================================================
+                # STEP 3A — Preparation Masking (Inclusion AOI & Manual Exclusions)
+                # ==============================================================
+                run_logger.info("Step 3A — Building authoritative preparation mask")
+
+                try:
+                    from ..wetland.exclusion import build_manual_exclusion_mask, build_inclusion_mask
+
+                    inclusion_geometry = config.get("inclusion_geometry")
+                    manual_exclusions = config.get("manual_exclusions", [])
+
+                    exclusion_dir = run_dir / "exclusions"
+                    exclusion_dir.mkdir(parents=True, exist_ok=True)
+
+                    inclusion_mask_path = (
+                        exclusion_dir / "inclusion_mask.tif"
+                    )
+                    manual_exclusion_mask_path = (
+                        exclusion_dir / "manual_exclusion_mask.tif"
                     )
 
-                outputs[
-                    "alignment/effective_analysis_mask.tif"
-                ] = "alignment/effective_analysis_mask.tif"
-                run_logger.info(
-                    "Step 3A — Preparation complete: inclusion=%s, %d exclusions, "
-                    "excluded_pixels=%d, effective_pixels=%d",
-                    "custom" if inclusion_geometry else "full",
-                    len(manual_exclusions),
-                    excluded_pixel_count,
-                    effective_pixel_count,
+                    run_logger.info(
+                        "[EXCLUSION TRACE] reference grid: "
+                        f"crs={ref_grid.crs}, "
+                        f"transform={ref_grid.transform}, "
+                        f"width={ref_grid.width}, "
+                        f"height={ref_grid.height}, "
+                        f"bounds={ref_grid.bounds}"
+                    )
+
+                    run_logger.info(
+                        "[EXCLUSION TRACE] inclusion geometry: "
+                        f"{'Provided' if inclusion_geometry else 'Full Grid'}"
+                    )
+                    run_logger.info(
+                        "[EXCLUSION TRACE] manual exclusions: "
+                        f"{len(manual_exclusions)} exclusions"
+                    )
+
+                    # 1. Build inclusion mask (1 = inside AOI, 0 = outside)
+                    inclusion_mask = build_inclusion_mask(
+                        geometry=inclusion_geometry,
+                        reference_grid=ref_grid,
+                        output_path=inclusion_mask_path,
+                    )
+
+                    # 2. Build manual exclusion mask (1 = excluded, 0 = not excluded)
+                    manual_exclusion_mask = build_manual_exclusion_mask(
+                        exclusions=manual_exclusions,
+                        reference_grid=ref_grid,
+                        output_path=manual_exclusion_mask_path,
+                    )
+
+                    # 3. Form authoritative effective analysis mask:
+                    # effective = overlap & inclusion & ~exclusion
+                    effective_overlap_mask = (
+                        overlap_mask.astype(bool)
+                        & inclusion_mask.astype(bool)
+                        & ~manual_exclusion_mask.astype(bool)
+                    )
+
+                    overlap_pixel_count = int(
+                        np.sum(overlap_mask.astype(bool))
+                    )
+
+                    inclusion_pixel_count = int(
+                        np.sum(
+                            overlap_mask.astype(bool)
+                            & inclusion_mask.astype(bool)
+                        )
+                    )
+
+                    excluded_pixel_count = int(
+                        np.sum(
+                            overlap_mask.astype(bool)
+                            & inclusion_mask.astype(bool)
+                            & manual_exclusion_mask.astype(bool)
+                        )
+                    )
+
+                    effective_pixel_count = int(
+                        np.sum(effective_overlap_mask)
+                    )
+
+                    outputs[
+                        "exclusions/inclusion_mask.tif"
+                    ] = "exclusions/inclusion_mask.tif"
+                    outputs[
+                        "exclusions/manual_exclusion_mask.tif"
+                    ] = "exclusions/manual_exclusion_mask.tif"
+
+                    # Physical hectare areas are only authoritative when the
+                    # analysis grid is georeferenced. For the current pixel-space
+                    # DJI test imagery (CRS=None + identity transform), pixel counts
+                    # remain authoritative and physical area is explicitly unavailable.
+                    total_overlap_area_ha = None
+                    inclusion_area_ha = None
+                    excluded_area_ha = None
+                    effective_analysis_area_ha = None
+                    physical_area_available = False
+                    area_basis = "PIXEL_COUNT_ONLY"
+
+                    try:
+                        if ref_grid.crs is not None:
+                            from ..metrics.area import calculate_pixel_areas
+
+                            pixel_areas = calculate_pixel_areas(
+                                ref_grid.transform,
+                                (ref_grid.height, ref_grid.width),
+                                ref_grid.crs,
+                            )
+
+                            total_overlap_area_ha = float(
+                                np.sum(
+                                    pixel_areas[
+                                        overlap_mask.astype(bool)
+                                    ]
+                                )
+                            ) / 10000.0
+
+                            inclusion_area_ha = float(
+                                np.sum(
+                                    pixel_areas[
+                                        overlap_mask.astype(bool)
+                                        & inclusion_mask.astype(bool)
+                                    ]
+                                )
+                            ) / 10000.0
+
+                            excluded_area_ha = float(
+                                np.sum(
+                                    pixel_areas[
+                                        overlap_mask.astype(bool)
+                                        & inclusion_mask.astype(bool)
+                                        & manual_exclusion_mask.astype(bool)
+                                    ]
+                                )
+                            ) / 10000.0
+
+                            effective_analysis_area_ha = float(
+                                np.sum(
+                                    pixel_areas[
+                                        effective_overlap_mask
+                                    ]
+                                )
+                            ) / 10000.0
+
+                            physical_area_available = True
+                            area_basis = "RASTER_CRS_AND_TRANSFORM"
+                        else:
+                            run_logger.warning(
+                                "Step 3A — Physical area unavailable: analysis grid "
+                                "has no CRS. Reporting pixel counts only."
+                            )
+                    except Exception as exc:
+                        run_logger.warning(
+                            "Failed to calculate physical exclusion areas: %s",
+                            exc,
+                        )
+
+                    if physical_area_available:
+                        run_logger.info(
+                            "Step 3A — Analysis footprint: total_overlap=%.4f ha, "
+                            "inclusion=%.4f ha, excluded=%.4f ha, effective=%.4f ha",
+                            total_overlap_area_ha,
+                            inclusion_area_ha,
+                            excluded_area_ha,
+                            effective_analysis_area_ha,
+                        )
+                    else:
+                        run_logger.info(
+                            "Step 3A — Analysis footprint: total_overlap_pixels=%d, "
+                            "inclusion_pixels=%d, excluded_pixels=%d, effective_pixels=%d; "
+                            "physical area unavailable.",
+                            overlap_pixel_count,
+                            inclusion_pixel_count,
+                            excluded_pixel_count,
+                            effective_pixel_count,
+                        )
+                    # Preserve the original alignment footprint separately from the
+                    # effective analysis footprint after manual exclusions.
+                    effective_mask_path = alignment_dir / "effective_analysis_mask.tif"
+
+                    effective_mask_profile = {
+                        "driver": "GTiff",
+                        "height": int(ref_grid.height),
+                        "width": int(ref_grid.width),
+                        "count": 1,
+                        "dtype": "uint8",
+                        "crs": ref_grid.crs,
+                        "transform": ref_grid.transform,
+                        "nodata": 0,
+                        "compress": "lzw",
+                    }
+
+                    with rasterio.open(
+                        effective_mask_path,
+                        "w",
+                        **effective_mask_profile,
+                    ) as dst:
+                        dst.write(
+                            effective_overlap_mask.astype(np.uint8),
+                            1,
+                        )
+
+                    outputs[
+                        "alignment/effective_analysis_mask.tif"
+                    ] = "alignment/effective_analysis_mask.tif"
+                    run_logger.info(
+                        "Step 3A — Preparation complete: inclusion=%s, %d exclusions, "
+                        "excluded_pixels=%d, effective_pixels=%d",
+                        "custom" if inclusion_geometry else "full",
+                        len(manual_exclusions),
+                        excluded_pixel_count,
+                        effective_pixel_count,
+                    )
+
+                except Exception as exc:
+                    raise GISProcessingError(
+                        f"Manual exclusion / preparation processing failed: {exc}"
+                    ) from exc
+
+                # Authoritative input band radiometric statistics
+                band_statistics: Dict[str, Any] = {"t1": {}, "t2": {}}
+                for b_name in ["green", "red", "rededge", "nir"]:
+                    arr1 = aligned_pair.t1_data.get(b_name)
+                    if arr1 is not None:
+                        v1 = arr1[effective_overlap_mask & ~np.isnan(arr1) & ~np.isinf(arr1)]
+                        if v1.size > 0:
+                            band_statistics["t1"][b_name] = {
+                                "valid_count": int(v1.size),
+                                "min": float(np.min(v1)),
+                                "max": float(np.max(v1)),
+                                "mean": float(np.mean(v1)),
+                                "median": float(np.median(v1)),
+                                "std": float(np.std(v1)),
+                                "p95": float(np.percentile(v1, 95.0)),
+                            }
+                    arr2 = aligned_pair.t2_data.get(b_name)
+                    if arr2 is not None:
+                        v2 = arr2[effective_overlap_mask & ~np.isnan(arr2) & ~np.isinf(arr2)]
+                        if v2.size > 0:
+                            band_statistics["t2"][b_name] = {
+                                "valid_count": int(v2.size),
+                                "min": float(np.min(v2)),
+                                "max": float(np.max(v2)),
+                                "mean": float(np.mean(v2)),
+                                "median": float(np.median(v2)),
+                                "std": float(np.std(v2)),
+                                "p95": float(np.percentile(v2, 95.0)),
+                            }
+                aligned_pair = fields(aligned_pair, "t1_data", "t2_data", "overlap_percentage")
+                return (
+                    aligned_pair, alignment_dir, t1_aligned_out,
+                    t2_aligned_out, overlap_mask, effective_overlap_mask,
+                    ref_grid, band_statistics, total_overlap_area_ha,
+                    inclusion_area_ha, excluded_area_ha, effective_analysis_area_ha,
+                    physical_area_available, area_basis, overlap_pixel_count,
+                    inclusion_pixel_count, excluded_pixel_count, effective_pixel_count,
                 )
 
-            except Exception as exc:
-                raise GISProcessingError(
-                    f"Manual exclusion / preparation processing failed: {exc}"
-                ) from exc
+            (
+                aligned_pair, alignment_dir, t1_aligned_out,
+                t2_aligned_out, overlap_mask, effective_overlap_mask,
+                ref_grid, band_statistics, total_overlap_area_ha,
+                inclusion_area_ha, excluded_area_ha, effective_analysis_area_ha,
+                physical_area_available, area_basis, overlap_pixel_count,
+                inclusion_pixel_count, excluded_pixel_count, effective_pixel_count,
+            ) = execute_stage(
+                "ALIGNMENT", run_alignment)
 
-            # Authoritative input band radiometric statistics
-            band_statistics: Dict[str, Any] = {"t1": {}, "t2": {}}
-            for b_name in ["green", "red", "rededge", "nir"]:
-                arr1 = aligned_pair.t1_data.get(b_name)
-                if arr1 is not None:
-                    v1 = arr1[effective_overlap_mask & ~np.isnan(arr1) & ~np.isinf(arr1)]
-                    if v1.size > 0:
-                        band_statistics["t1"][b_name] = {
-                            "valid_count": int(v1.size),
-                            "min": float(np.min(v1)),
-                            "max": float(np.max(v1)),
-                            "mean": float(np.mean(v1)),
-                            "median": float(np.median(v1)),
-                            "std": float(np.std(v1)),
-                            "p95": float(np.percentile(v1, 95.0)),
-                        }
-                arr2 = aligned_pair.t2_data.get(b_name)
-                if arr2 is not None:
-                    v2 = arr2[effective_overlap_mask & ~np.isnan(arr2) & ~np.isinf(arr2)]
-                    if v2.size > 0:
-                        band_statistics["t2"][b_name] = {
-                            "valid_count": int(v2.size),
-                            "min": float(np.min(v2)),
-                            "max": float(np.max(v2)),
-                            "mean": float(np.mean(v2)),
-                            "median": float(np.median(v2)),
-                            "std": float(np.std(v2)),
-                            "p95": float(np.percentile(v2, 95.0)),
-                        }
-            # ==============================================================
-            # STEP 4–7 — Reusable Vegetation Analysis Pipeline (Two-Date Wetland)
-            # ==============================================================
-            run_logger.info("Steps 4–7 — Vegetation analysis on T1 & T2")
-
-            try:
+            def run_vegetation_inference():
                 from ..vegetation.pipeline import VegetationAnalysisPipeline
                 from ..core.results import TwoDateInferenceResult
                 from ..core.pair import calculate_class_stats
-                from ..change.transition import calculate_transitions
-                from ..change.cva import calculate_cva
-                from ..change.degradation import analyze_degradation
-
                 vegetation_pipeline = VegetationAnalysisPipeline()
 
                 veg_t1_dir = veg_dir / "T1"
@@ -1103,7 +1186,16 @@ class ProductionPipeline:
                 }
                 write_pair_metadata_json(str(veg_dir / "pair_metadata.json"), pair_meta_dict)
                 outputs["vegetation/pair_metadata.json"] = "vegetation/pair_metadata.json"
+                pair_result = fields(pair_result, "class_statistics_t1", "class_statistics_t2", "t1_confidence")
+                return (t1_health, t2_health, pair_result, perf,)
 
+            (t1_health, t2_health, pair_result, perf,) = execute_stage(
+                "VEGETATION_INFERENCE", run_vegetation_inference)
+
+            def run_change_analysis():
+                from ..change.transition import calculate_transitions
+                from ..change.cva import calculate_cva
+                from ..change.degradation import analyze_degradation
                 # Step 5: Transition Analysis
                 run_logger.info("Vegetation analysis — transition analysis")
                 trans_result = calculate_transitions(
@@ -1152,17 +1244,24 @@ class ProductionPipeline:
                 )
                 for fname in ["degradation_map.tif", "recovery_map.tif", "residual_stress.tif", "canopy_loss_map.tif"]:
                     outputs[f"degradation/{fname}"] = f"degradation/{fname}"
+                trans_result = fields(trans_result, "category_counts", "category_areas_ha", "category_percentages", "transition_areas_m2", "transition_counts")
+                cva_result = fields(cva_result, "statistics")
+                deg_result = fields(deg_result, "statistics")
+                return (
+                    transition_map, delta_ndvi, delta_gndvi,
+                    delta_ndre, cva_magnitude, trans_result,
+                    cva_result, deg_result,
+                )
 
-            except Exception as exc:
-                raise GISProcessingError(
-                    f"Vegetation analysis failed: {exc}"
-                ) from exc
+            (
+                transition_map, delta_ndvi, delta_gndvi,
+                delta_ndre, cva_magnitude, trans_result,
+                cva_result, deg_result,
+            ) = execute_stage(
+                "CHANGE_ANALYSIS", run_change_analysis)
 
-            run_logger.info(
-                "Steps 4–7 — Vegetation analysis complete"
-            )
-            # ==============================================================
-            if dispatcher.requires_wetland_context:
+            def run_wetland_analysis():
+                hydro_metrics, fusion_metrics = {}, {}
                 # STEP 8 — Wetland Context
                 # ==============================================================
                 run_logger.info("Step 8 — Wetland context")
@@ -1275,7 +1374,14 @@ class ProductionPipeline:
                     run_logger.warning("Step 10 — water_change.tif missing; fusion skipped")
 
                 run_logger.info("Step 10 — Fusion complete")
+                wetland_result = fields(wetland_result, "valid_analysis_mask", "wetland_mask", "status", "source_type", "wetland_area_ha", "physical_wetland_depletion_enabled")
+                return (wetland_result, hydro_metrics, fusion_metrics,)
 
+            (wetland_result, hydro_metrics, fusion_metrics,) = execute_stage(
+                "WETLAND_ANALYSIS", run_wetland_analysis)
+
+            def run_metrics_qa():
+                qa_dict, metrics_result_dict = {"overall_status": "PASS", "flags": []}, {}
                 # ==============================================================
                 # STEP 11 — Metrics
                 # ==============================================================
@@ -1356,401 +1462,408 @@ class ProductionPipeline:
                     run_logger.warning("Step 12 — QA issue: %s", exc)
 
                 run_logger.info("Step 12 — QA: %s", qa_dict.get("overall_status", "UNKNOWN"))
-
+                # STEP 13 — Assemble result package
                 # ==============================================================
+                run_logger.info("Step 13 — Assembling result package")
+                total_runtime = time.perf_counter() - run_start
 
-            # STEP 13 — Assemble result package
-            # ==============================================================
-            run_logger.info("Step 13 — Assembling result package")
-            total_runtime = time.perf_counter() - run_start
-
-            veg_stats: Dict[str, Any] = {}
-            if pair_result:
-                veg_stats = {
-                    "t1": pair_result.class_statistics_t1,
-                    "t2": pair_result.class_statistics_t2,
-                }
-
-            deg_stats: Dict[str, Any] = {}
-            rec_stats: Dict[str, Any] = {}
-            if deg_result:
-                stats = deg_result.statistics
-                deg_count = stats.get("degradation_pixel_count", 0)
-                rec_count = stats.get("recovery_pixel_count", 0)
-                valid_cnt = stats.get("valid_pixel_count", 1) or 1
-                deg_pct   = stats.get("degradation_percentage", 0.0)
-                rec_pct   = stats.get("recovery_percentage", 0.0)
-                # Area from metrics if available — use the actual field names from MetricsResult
-                deg_area_ha = metrics_result_dict.get("impact_area", {}).get("impact_area_ha", 0.0) if metrics_result_dict else 0.0
-                rec_area_ha = metrics_result_dict.get("recovery_area", {}).get("area_ha", 0.0) if metrics_result_dict else 0.0
-                deg_stats = {"pixel_count": deg_count, "area_ha": deg_area_ha, "percentage": deg_pct}
-                rec_stats = {"pixel_count": rec_count, "area_ha": rec_area_ha, "percentage": rec_pct}
-
-            cva_stats: Dict[str, Any] = {}
-            if cva_result:
-                cva_stats = cva_result.statistics
-
-            change_summary: Dict[str, Any] = {}
-            if trans_result:
-                change_summary = {
-                    cat: {
-                        "count": trans_result.category_counts.get(cat, 0),
-                        "area_ha": trans_result.category_areas_ha.get(cat, 0.0),
-                        "percentage": trans_result.category_percentages.get(cat, 0.0),
-                    }
-                    for cat in trans_result.category_counts
-                }
-
-            # Authoritative spectral index statistics (NDVI, GNDVI, NDRE, NDWI)
-            index_stats: Dict[str, Any] = {}
-            if aligned_pair is not None and effective_overlap_mask is not None:
-                nir1, red1 = aligned_pair.t1_data.get("nir"), aligned_pair.t1_data.get("red")
-                green1, re1 = aligned_pair.t1_data.get("green"), aligned_pair.t1_data.get("rededge")
-                nir2, red2 = aligned_pair.t2_data.get("nir"), aligned_pair.t2_data.get("red")
-                green2, re2 = aligned_pair.t2_data.get("green"), aligned_pair.t2_data.get("rededge")
-
-                eps = 1e-7
-
-                def _calc_idx_stats(arr1: np.ndarray, arr2: np.ndarray, formula_str: str) -> Dict[str, Any]:
-                    v1 = arr1[effective_overlap_mask & ~np.isnan(arr1) & ~np.isinf(arr1)] if arr1 is not None else np.array([])
-                    v2 = arr2[effective_overlap_mask & ~np.isnan(arr2) & ~np.isinf(arr2)] if arr2 is not None else np.array([])
-                    d_arr = (arr2 - arr1) if (arr1 is not None and arr2 is not None) else None
-                    vd = d_arr[effective_overlap_mask & ~np.isnan(d_arr) & ~np.isinf(d_arr)] if d_arr is not None else np.array([])
-                    return {
-                        "formula": formula_str,
-                        "t1_mean": float(np.mean(v1)) if v1.size else 0.0,
-                        "t1_median": float(np.median(v1)) if v1.size else 0.0,
-                        "t1_std": float(np.std(v1)) if v1.size else 0.0,
-                        "t1_p95": float(np.percentile(v1, 95.0)) if v1.size else 0.0,
-                        "t2_mean": float(np.mean(v2)) if v2.size else 0.0,
-                        "t2_median": float(np.median(v2)) if v2.size else 0.0,
-                        "t2_std": float(np.std(v2)) if v2.size else 0.0,
-                        "t2_p95": float(np.percentile(v2, 95.0)) if v2.size else 0.0,
-                        "delta_mean": float(np.mean(vd)) if vd.size else 0.0,
-                        "delta_median": float(np.median(vd)) if vd.size else 0.0,
-                        "delta_std": float(np.std(vd)) if vd.size else 0.0,
-                        "delta_p95": float(np.percentile(vd, 95.0)) if vd.size else 0.0,
+                veg_stats: Dict[str, Any] = {}
+                if pair_result:
+                    veg_stats = {
+                        "t1": pair_result.class_statistics_t1,
+                        "t2": pair_result.class_statistics_t2,
                     }
 
-                if nir1 is not None and red1 is not None and nir2 is not None and red2 is not None:
-                    ndvi1 = (nir1 - red1) / (nir1 + red1 + eps)
-                    ndvi2 = (nir2 - red2) / (nir2 + red2 + eps)
-                    index_stats["ndvi"] = _calc_idx_stats(ndvi1, ndvi2, "(NIR - Red) / (NIR + Red)")
+                deg_stats: Dict[str, Any] = {}
+                rec_stats: Dict[str, Any] = {}
+                if deg_result:
+                    stats = deg_result.statistics
+                    deg_count = stats.get("degradation_pixel_count", 0)
+                    rec_count = stats.get("recovery_pixel_count", 0)
+                    valid_cnt = stats.get("valid_pixel_count", 1) or 1
+                    deg_pct   = stats.get("degradation_percentage", 0.0)
+                    rec_pct   = stats.get("recovery_percentage", 0.0)
+                    # Area from metrics if available — use the actual field names from MetricsResult
+                    deg_area_ha = metrics_result_dict.get("impact_area", {}).get("impact_area_ha", 0.0) if metrics_result_dict else 0.0
+                    rec_area_ha = metrics_result_dict.get("recovery_area", {}).get("area_ha", 0.0) if metrics_result_dict else 0.0
+                    deg_stats = {"pixel_count": deg_count, "area_ha": deg_area_ha, "percentage": deg_pct}
+                    rec_stats = {"pixel_count": rec_count, "area_ha": rec_area_ha, "percentage": rec_pct}
 
-                if nir1 is not None and green1 is not None and nir2 is not None and green2 is not None:
-                    gndvi1 = (nir1 - green1) / (nir1 + green1 + eps)
-                    gndvi2 = (nir2 - green2) / (nir2 + green2 + eps)
-                    index_stats["gndvi"] = _calc_idx_stats(gndvi1, gndvi2, "(NIR - Green) / (NIR + Green)")
+                cva_stats: Dict[str, Any] = {}
+                if cva_result:
+                    cva_stats = cva_result.statistics
 
-                if nir1 is not None and re1 is not None and nir2 is not None and re2 is not None:
-                    ndre1 = (nir1 - re1) / (nir1 + re1 + eps)
-                    ndre2 = (nir2 - re2) / (nir2 + re2 + eps)
-                    index_stats["ndre"] = _calc_idx_stats(ndre1, ndre2, "(NIR - RedEdge) / (NIR + RedEdge)")
+                change_summary: Dict[str, Any] = {}
+                if trans_result:
+                    change_summary = {
+                        cat: {
+                            "count": trans_result.category_counts.get(cat, 0),
+                            "area_ha": trans_result.category_areas_ha.get(cat, 0.0),
+                            "percentage": trans_result.category_percentages.get(cat, 0.0),
+                        }
+                        for cat in trans_result.category_counts
+                    }
+
+                # Authoritative spectral index statistics (NDVI, GNDVI, NDRE, NDWI)
+                index_stats: Dict[str, Any] = {}
+                if aligned_pair is not None and effective_overlap_mask is not None:
+                    nir1, red1 = aligned_pair.t1_data.get("nir"), aligned_pair.t1_data.get("red")
+                    green1, re1 = aligned_pair.t1_data.get("green"), aligned_pair.t1_data.get("rededge")
+                    nir2, red2 = aligned_pair.t2_data.get("nir"), aligned_pair.t2_data.get("red")
+                    green2, re2 = aligned_pair.t2_data.get("green"), aligned_pair.t2_data.get("rededge")
+
+                    eps = 1e-7
+
+                    def _calc_idx_stats(arr1: np.ndarray, arr2: np.ndarray, formula_str: str) -> Dict[str, Any]:
+                        v1 = arr1[effective_overlap_mask & ~np.isnan(arr1) & ~np.isinf(arr1)] if arr1 is not None else np.array([])
+                        v2 = arr2[effective_overlap_mask & ~np.isnan(arr2) & ~np.isinf(arr2)] if arr2 is not None else np.array([])
+                        d_arr = (arr2 - arr1) if (arr1 is not None and arr2 is not None) else None
+                        vd = d_arr[effective_overlap_mask & ~np.isnan(d_arr) & ~np.isinf(d_arr)] if d_arr is not None else np.array([])
+                        return {
+                            "formula": formula_str,
+                            "t1_mean": float(np.mean(v1)) if v1.size else 0.0,
+                            "t1_median": float(np.median(v1)) if v1.size else 0.0,
+                            "t1_std": float(np.std(v1)) if v1.size else 0.0,
+                            "t1_p95": float(np.percentile(v1, 95.0)) if v1.size else 0.0,
+                            "t2_mean": float(np.mean(v2)) if v2.size else 0.0,
+                            "t2_median": float(np.median(v2)) if v2.size else 0.0,
+                            "t2_std": float(np.std(v2)) if v2.size else 0.0,
+                            "t2_p95": float(np.percentile(v2, 95.0)) if v2.size else 0.0,
+                            "delta_mean": float(np.mean(vd)) if vd.size else 0.0,
+                            "delta_median": float(np.median(vd)) if vd.size else 0.0,
+                            "delta_std": float(np.std(vd)) if vd.size else 0.0,
+                            "delta_p95": float(np.percentile(vd, 95.0)) if vd.size else 0.0,
+                        }
+
+                    if nir1 is not None and red1 is not None and nir2 is not None and red2 is not None:
+                        ndvi1 = (nir1 - red1) / (nir1 + red1 + eps)
+                        ndvi2 = (nir2 - red2) / (nir2 + red2 + eps)
+                        index_stats["ndvi"] = _calc_idx_stats(ndvi1, ndvi2, "(NIR - Red) / (NIR + Red)")
+
+                    if nir1 is not None and green1 is not None and nir2 is not None and green2 is not None:
+                        gndvi1 = (nir1 - green1) / (nir1 + green1 + eps)
+                        gndvi2 = (nir2 - green2) / (nir2 + green2 + eps)
+                        index_stats["gndvi"] = _calc_idx_stats(gndvi1, gndvi2, "(NIR - Green) / (NIR + Green)")
+
+                    if nir1 is not None and re1 is not None and nir2 is not None and re2 is not None:
+                        ndre1 = (nir1 - re1) / (nir1 + re1 + eps)
+                        ndre2 = (nir2 - re2) / (nir2 + re2 + eps)
+                        index_stats["ndre"] = _calc_idx_stats(ndre1, ndre2, "(NIR - RedEdge) / (NIR + RedEdge)")
+
+                    if dispatcher.is_wetland:
+                        if green1 is not None and nir1 is not None and green2 is not None and nir2 is not None:
+                            ndwi1 = (green1 - nir1) / (green1 + nir1 + eps)
+                            ndwi2 = (green2 - nir2) / (green2 + nir2 + eps)
+                            index_stats["ndwi"] = _calc_idx_stats(
+                                ndwi1,
+                                ndwi2,
+                                "(Green - NIR) / (Green + NIR)",
+                            )
+
+                # Physical depletion
+                indep_hydro = config.get("fusion", {}).get("independent_hydrological_source_accepted", False)
+                if indep_hydro and wetland_result and wetland_result.physical_wetland_depletion_enabled:
+                    phys_depl = "SUPPORTED_BY_INDEPENDENT_EVIDENCE"
+                else:
+                    phys_depl = PHYSICAL_DEPLETION_DEFAULT
+
+                result_content: Dict[str, Any] = {
+                    "run_id": run_id,
+                    "software_version": SOFTWARE_VERSION,
+                    "analysis_mode": dispatcher.analysis_mode,
+                    "status": "WARNING" if warnings else "SUCCESS",
+
+                    "inputs": {
+                        "t1_path": str(t1_scene),
+                        "t2_path": str(t2_scene),
+                        "model_path": str(model_path),
+                        "wetland_boundary": str(wetland_boundary) if wetland_boundary else None,
+                        "band_statistics": band_statistics,
+                    },
+
+                    "temporal": {
+                        "t1_date": t1_date,
+                        "t2_date": t2_date,
+                        "interval_days": interval_days,
+                    },
+
+                    "spectral_indices": index_stats,
+
+                    "spatial": {
+                        "crs": str(ref_grid.crs),
+                        "dimensions": [ref_grid.height, ref_grid.width],
+                        "resolution": list(ref_grid.resolution),
+                        "extent": list(ref_grid.bounds),
+                        "overlap_percentage": aligned_pair.overlap_percentage if aligned_pair else None,
+                        "total_overlap_area_ha": total_overlap_area_ha,
+                        "inclusion_area_ha": inclusion_area_ha,
+                        "manual_excluded_area_ha": excluded_area_ha,
+                        "effective_analysis_area_ha": effective_analysis_area_ha,
+                        "physical_area_available": physical_area_available,
+                        "area_basis": area_basis,
+                        "overlap_pixel_count": overlap_pixel_count,
+                        "inclusion_pixel_count": inclusion_pixel_count,
+                        "excluded_pixel_count": excluded_pixel_count,
+                        "effective_pixel_count": effective_pixel_count,
+                    },
+
+                    # Common vegetation-analysis results.
+                    "vegetation": veg_stats,
+                    "change": {
+                        "category_summary": change_summary,
+                    },
+                    "cva": cva_stats,
+                    "degradation": deg_stats,
+                    "recovery": rec_stats,
+
+                    # Common analysis metrics.
+                    "metrics": {
+                        "normalized_degradation_ratio": (
+                            metrics_result_dict.get("normalized_degradation_ratio")
+                            if metrics_result_dict
+                            else None
+                        ),
+
+                        "severity_weighted_degradation_area_ha": (
+                            metrics_result_dict.get("severity_weighted_area", {})
+                            .get("severity_weighted_area_ha_deg")
+                            if metrics_result_dict
+                            else None
+                        ),
+
+                        # Stable public API fields.
+                        "impact_area": {
+                            "degradation_ha": (
+                                metrics_result_dict.get("impact_area", {})
+                                .get("impact_area_ha", 0.0)
+                                if metrics_result_dict
+                                else 0.0
+                            ),
+                        },
+
+                        "recovery_area": {
+                            "recovery_ha": (
+                                metrics_result_dict.get("recovery_area", {})
+                                .get("area_ha", 0.0)
+                                if metrics_result_dict
+                                else 0.0
+                            ),
+                        },
+
+                        "cva_magnitude": {
+                            "mean": (
+                                (
+                                    metrics_result_dict
+                                    .get("cva_statistics", {})
+                                    .get("all_valid_wetland", {})
+                                    .get("mean")
+                                )
+                                if (
+                                    metrics_result_dict
+                                    and metrics_result_dict
+                                    .get("cva_statistics", {})
+                                    .get("all_valid_wetland", {})
+                                    .get("mean") is not None
+                                )
+                                else 0.0
+                            ),
+                        },
+
+                        "analysis_extent": {
+                            "valid_analysis_area_ha": (
+                                metrics_result_dict.get("baseline_area", {})
+                                .get("area_ha", 0.0)
+                                if metrics_result_dict
+                                else 0.0
+                            ),
+                        },
+
+                        "transition_matrix": {
+                            "matrix_m2": [
+                                [float(trans_result.transition_areas_m2.get(i * 4 + j) or 0.0) for j in range(4)]
+                                for i in range(4)
+                            ],
+                            "matrix_pixels": [
+                                [int(trans_result.transition_counts.get(i * 4 + j) or 0) for j in range(4)]
+                                for i in range(4)
+                            ],
+                        } if trans_result else None,
+                    },
+
+                    "validation": qa_dict,
+
+                    "uncertainty": {
+                        "mean_confidence_t1": (
+                            float(np.nanmean(pair_result.t1_confidence))
+                            if pair_result and hasattr(pair_result, "t1_confidence")
+                            else None
+                        ),
+                    },
+
+                    "warnings": warnings,
+                    "errors": errors,
+                    "outputs": outputs,
+
+                    "performance": {
+                        "total_runtime_seconds": total_runtime,
+                        "inference": perf if pair_result else {},
+                    },
+                }
+
+                _write_json(run_dir / "analysis_result.json", result_content)
 
                 if dispatcher.is_wetland:
-                    if green1 is not None and nir1 is not None and green2 is not None and nir2 is not None:
-                        ndwi1 = (green1 - nir1) / (green1 + nir1 + eps)
-                        ndwi2 = (green2 - nir2) / (green2 + nir2 + eps)
-                        index_stats["ndwi"] = _calc_idx_stats(
-                            ndwi1,
-                            ndwi2,
-                            "(Green - NIR) / (Green + NIR)",
-                        )
+                    result_content["wetland"] = {
+                        "status": wetland_result.status if wetland_result else "UNAVAILABLE",
+                        "source_type": wetland_result.source_type if wetland_result else "UNAVAILABLE",
+                        "area_ha": wetland_result.wetland_area_ha if wetland_result else 0.0,
+                        "physical_depletion_enabled": (
+                            wetland_result.physical_wetland_depletion_enabled
+                            if wetland_result
+                            else False
+                        ),
+                    }
 
-            # Physical depletion
-            indep_hydro = config.get("fusion", {}).get("independent_hydrological_source_accepted", False)
-            if indep_hydro and wetland_result and wetland_result.physical_wetland_depletion_enabled:
-                phys_depl = "SUPPORTED_BY_INDEPENDENT_EVIDENCE"
-            else:
-                phys_depl = PHYSICAL_DEPLETION_DEFAULT
+                    result_content["hydrology"] = {
+                        "ndwi_threshold": config.get("water", {}).get("ndwi_threshold", 0.0),
+                        "water_gain_area_ha": hydro_metrics.get("water_gain_ha"),
+                        "water_loss_area_ha": hydro_metrics.get("water_loss_ha"),
+                        "water_area_t1_ha": hydro_metrics.get("water_area_t1_ha"),
+                        "water_area_t2_ha": hydro_metrics.get("water_area_t2_ha"),
+                    }
 
-            result_content: Dict[str, Any] = {
-                "run_id": run_id,
-                "software_version": SOFTWARE_VERSION,
-                "analysis_mode": dispatcher.analysis_mode,
-                "status": "WARNING" if warnings else "SUCCESS",
+                    result_content["fusion"] = {
+                        "evidence_level": fusion_metrics.get(
+                            "physical_depletion_assessment",
+                            "N/A",
+                        ),
+                        "hydro_ecological_degradation_area_ha": fusion_metrics.get(
+                            "hydro_ecological_degradation_area_ha"
+                        ),
+                        "hydro_ecological_recovery_area_ha": fusion_metrics.get(
+                            "hydro_ecological_recovery_area_ha"
+                        ),
+                    }
 
-                "inputs": {
-                    "t1_path": str(t1_scene),
-                    "t2_path": str(t2_scene),
+                    result_content["physical_depletion_assessment"] = phys_depl
+                _write_json(run_dir / "analysis_result.json", result_content)
+                outputs["analysis_result.json"] = "analysis_result.json"
+                return (result_content, qa_dict,)
+
+            (result_content, qa_dict,) = execute_stage(
+                "METRICS_QA", run_metrics_qa)
+
+            def run_reporting():
+                # ==============================================================
+                # STEP 14 — Generate Analysis Reports (Markdown, Figures & PDF)
+                # ==============================================================
+                run_logger.info("Step 14 — Generating analysis reports")
+                try:
+                    from ..output.report import generate_analysis_report
+                    generate_analysis_report(
+                        result_dict=result_content,
+                        output_path=reports_dir / "analysis_report.md",
+                        run_id=run_id,
+                    )
+                    outputs["reports/analysis_report.md"] = "reports/analysis_report.md"
+                except Exception as exc:
+                    warnings.append(f"Markdown Report: {exc}")
+                    run_logger.warning("Step 14 — Markdown report warning: %s", exc)
+
+                map_assets: Dict[str, Path] = {}
+                try:
+                    from ..output.cartography import generate_report_maps
+                    map_assets = generate_report_maps(
+                        run_dir=run_dir,
+                        figures_dir=reports_dir / "figures",
+                    )
+                    for fig_key, fig_path in map_assets.items():
+                        rel_fig = str(fig_path.relative_to(run_dir)).replace("\\", "/")
+                        outputs[f"reports/figures/{fig_path.name}"] = rel_fig
+                except Exception as exc:
+                    warnings.append(f"Map Rendering: {exc}")
+                    run_logger.warning("Step 14 — Map rendering warning: %s", exc)
+
+                try:
+                    from ..output.pdf import generate_all_reports
+                    generated_pdfs = generate_all_reports(
+                        result_dict=result_content,
+                        run_dir=run_dir,
+                        reports_dir=reports_dir,
+                        map_assets=map_assets,
+                        run_id=run_id,
+                    )
+                    # Register all generated PDFs in the output manifest
+                    for pdf_key, pdf_path in generated_pdfs.items():
+                        rel = str(pdf_path.relative_to(run_dir)).replace("\\", "/")
+                        outputs[rel] = rel
+                except Exception as exc:
+                    warnings.append(f"PDF Report: {exc}")
+                    run_logger.warning("Step 14 — PDF report warning: %s", exc)
+
+                # ==============================================================
+                # STEP 15 — Provenance metadata.json
+                # ==============================================================
+                run_logger.info("Step 15 — Writing provenance metadata")
+                model_sha256 = _file_sha256(model_path)
+                try:
+                    import subprocess
+                    git_commit = subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+                    ).decode().strip()
+                except Exception:
+                    git_commit = "unavailable"
+
+                metadata: Dict[str, Any] = {
+                    "run_id": run_id,
+                    "software_version": SOFTWARE_VERSION,
+                    "analysis_mode": dispatcher.analysis_mode,
+                    "git_commit": git_commit,
+                    "execution_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "python_version": sys.version,
+                    "os": platform.platform(),
                     "model_path": str(model_path),
-                    "wetland_boundary": str(wetland_boundary) if wetland_boundary else None,
-                    "band_statistics": band_statistics,
-                },
-
-                "temporal": {
+                    "model_sha256": model_sha256,
+                    "configuration_hash": cfg_hash,
+                    "config_snapshot": str(config_snapshot_path),
+                    "input_t1": _file_fingerprint(t1_scene),
+                    "input_t2": _file_fingerprint(t2_scene),
                     "t1_date": t1_date,
                     "t2_date": t2_date,
-                    "interval_days": interval_days,
-                },
-
-                "spectral_indices": index_stats,
-
-                "spatial": {
-                    "crs": str(ref_grid.crs),
-                    "dimensions": [ref_grid.height, ref_grid.width],
-                    "resolution": list(ref_grid.resolution),
-                    "extent": list(ref_grid.bounds),
-                    "overlap_percentage": aligned_pair.overlap_percentage if aligned_pair else None,
-                    "total_overlap_area_ha": total_overlap_area_ha,
-                    "inclusion_area_ha": inclusion_area_ha,
-                    "manual_excluded_area_ha": excluded_area_ha,
-                    "effective_analysis_area_ha": effective_analysis_area_ha,
-                    "physical_area_available": physical_area_available,
-                    "area_basis": area_basis,
-                    "overlap_pixel_count": overlap_pixel_count,
-                    "inclusion_pixel_count": inclusion_pixel_count,
-                    "excluded_pixel_count": excluded_pixel_count,
-                    "effective_pixel_count": effective_pixel_count,
-                },
-
-                # Common vegetation-analysis results.
-                "vegetation": veg_stats,
-                "change": {
-                    "category_summary": change_summary,
-                },
-                "cva": cva_stats,
-                "degradation": deg_stats,
-                "recovery": rec_stats,
-
-                # Common analysis metrics.
-                "metrics": {
-                    "normalized_degradation_ratio": (
-                        metrics_result_dict.get("normalized_degradation_ratio")
-                        if metrics_result_dict
-                        else None
-                    ),
-
-                    "severity_weighted_degradation_area_ha": (
-                        metrics_result_dict.get("severity_weighted_area", {})
-                        .get("severity_weighted_area_ha_deg")
-                        if metrics_result_dict
-                        else None
-                    ),
-
-                    # Stable public API fields.
-                    "impact_area": {
-                        "degradation_ha": (
-                            metrics_result_dict.get("impact_area", {})
-                            .get("impact_area_ha", 0.0)
-                            if metrics_result_dict
-                            else 0.0
-                        ),
-                    },
-
-                    "recovery_area": {
-                        "recovery_ha": (
-                            metrics_result_dict.get("recovery_area", {})
-                            .get("area_ha", 0.0)
-                            if metrics_result_dict
-                            else 0.0
-                        ),
-                    },
-
-                    "cva_magnitude": {
-                        "mean": (
-                            (
-                                metrics_result_dict
-                                .get("cva_statistics", {})
-                                .get("all_valid_wetland", {})
-                                .get("mean")
-                            )
-                            if (
-                                metrics_result_dict
-                                and metrics_result_dict
-                                .get("cva_statistics", {})
-                                .get("all_valid_wetland", {})
-                                .get("mean") is not None
-                            )
-                            else 0.0
-                        ),
-                    },
-
-                    "analysis_extent": {
-                        "valid_analysis_area_ha": (
-                            metrics_result_dict.get("baseline_area", {})
-                            .get("area_ha", 0.0)
-                            if metrics_result_dict
-                            else 0.0
-                        ),
-                    },
-
-                    "transition_matrix": {
-                        "matrix_m2": [
-                            [float(trans_result.transition_areas_m2.get(i * 4 + j) or 0.0) for j in range(4)]
-                            for i in range(4)
-                        ],
-                        "matrix_pixels": [
-                            [int(trans_result.transition_counts.get(i * 4 + j) or 0) for j in range(4)]
-                            for i in range(4)
-                        ],
-                    } if trans_result else None,
-                },
-
-                "validation": qa_dict,
-
-                "uncertainty": {
-                    "mean_confidence_t1": (
-                        float(np.nanmean(pair_result.t1_confidence))
-                        if pair_result and hasattr(pair_result, "t1_confidence")
-                        else None
-                    ),
-                },
-
-                "warnings": warnings,
-                "errors": errors,
-                "outputs": outputs,
-
-                "performance": {
-                    "total_runtime_seconds": total_runtime,
-                    "inference": perf if pair_result else {},
-                },
-            }
-
-            _write_json(run_dir / "analysis_result.json", result_content)
-
-            if dispatcher.is_wetland:
-                result_content["wetland"] = {
-                    "status": wetland_result.status if wetland_result else "UNAVAILABLE",
-                    "source_type": wetland_result.source_type if wetland_result else "UNAVAILABLE",
-                    "area_ha": wetland_result.wetland_area_ha if wetland_result else 0.0,
-                    "physical_depletion_enabled": (
-                        wetland_result.physical_wetland_depletion_enabled
-                        if wetland_result
-                        else False
-                    ),
+                    "crs": str(ref_grid.crs) if ref_grid else None,
+                    "resolution": list(ref_grid.resolution) if ref_grid else None,
+                    "dimensions": [ref_grid.height, ref_grid.width] if ref_grid else None,
+                    "total_runtime_seconds": time.perf_counter() - run_start,
                 }
+                _write_json(run_dir / "metadata.json", metadata)
+                outputs["metadata.json"] = "metadata.json"
 
-                result_content["hydrology"] = {
-                    "ndwi_threshold": config.get("water", {}).get("ndwi_threshold", 0.0),
-                    "water_gain_area_ha": hydro_metrics.get("water_gain_ha"),
-                    "water_loss_area_ha": hydro_metrics.get("water_loss_ha"),
-                    "water_area_t1_ha": hydro_metrics.get("water_area_t1_ha"),
-                    "water_area_t2_ha": hydro_metrics.get("water_area_t2_ha"),
+                # ==============================================================
+                # STEP 16 — Output manifest.json
+                # ==============================================================
+                run_logger.info("Step 16 — Writing output manifest")
+                manifest = {
+                    "run_id": run_id,
+                    "generated_utc": datetime.now(timezone.utc).isoformat(),
+                    "total_outputs": len(outputs),
+                    "outputs": [_output_entry(run_dir, rel) for rel in outputs.values()],
                 }
+                _write_json(run_dir / "manifest.json", manifest)
+                outputs["manifest.json"] = "manifest.json"
 
-                result_content["fusion"] = {
-                    "evidence_level": fusion_metrics.get(
-                        "physical_depletion_assessment",
-                        "N/A",
-                    ),
-                    "hydro_ecological_degradation_area_ha": fusion_metrics.get(
-                        "hydro_ecological_degradation_area_ha"
-                    ),
-                    "hydro_ecological_recovery_area_ha": fusion_metrics.get(
-                        "hydro_ecological_recovery_area_ha"
-                    ),
-                }
-
-                result_content["physical_depletion_assessment"] = phys_depl
-            _write_json(run_dir / "analysis_result.json", result_content)
-            outputs["analysis_result.json"] = "analysis_result.json"
-
-            # ==============================================================
-            # STEP 14 — Generate Analysis Reports (Markdown, Figures & PDF)
-            # ==============================================================
-            run_logger.info("Step 14 — Generating analysis reports")
-            try:
-                from ..output.report import generate_analysis_report
-                generate_analysis_report(
-                    result_dict=result_content,
-                    output_path=reports_dir / "analysis_report.md",
-                    run_id=run_id,
+                # ==============================================================
+                # Done
+                # ==============================================================
+                final_status = "WARNING" if warnings else "SUCCESS"
+                run_logger.info(
+                    "Phase 13 — Pipeline COMPLETE. status=%s run_id=%s runtime=%.1fs",
+                    final_status, run_id, time.perf_counter() - run_start,
                 )
-                outputs["reports/analysis_report.md"] = "reports/analysis_report.md"
-            except Exception as exc:
-                warnings.append(f"Markdown Report: {exc}")
-                run_logger.warning("Step 14 — Markdown report warning: %s", exc)
 
-            map_assets: Dict[str, Path] = {}
-            try:
-                from ..output.cartography import generate_report_maps
-                map_assets = generate_report_maps(
-                    run_dir=run_dir,
-                    figures_dir=reports_dir / "figures",
-                )
-                for fig_key, fig_path in map_assets.items():
-                    rel_fig = str(fig_path.relative_to(run_dir)).replace("\\", "/")
-                    outputs[f"reports/figures/{fig_path.name}"] = rel_fig
-            except Exception as exc:
-                warnings.append(f"Map Rendering: {exc}")
-                run_logger.warning("Step 14 — Map rendering warning: %s", exc)
+                return (metadata, final_status,)
 
-            try:
-                from ..output.pdf import generate_all_reports
-                generated_pdfs = generate_all_reports(
-                    result_dict=result_content,
-                    run_dir=run_dir,
-                    reports_dir=reports_dir,
-                    map_assets=map_assets,
-                    run_id=run_id,
-                )
-                # Register all generated PDFs in the output manifest
-                for pdf_key, pdf_path in generated_pdfs.items():
-                    rel = str(pdf_path.relative_to(run_dir)).replace("\\", "/")
-                    outputs[rel] = rel
-            except Exception as exc:
-                warnings.append(f"PDF Report: {exc}")
-                run_logger.warning("Step 14 — PDF report warning: %s", exc)
-
-            # ==============================================================
-            # STEP 15 — Provenance metadata.json
-            # ==============================================================
-            run_logger.info("Step 15 — Writing provenance metadata")
-            model_sha256 = _file_sha256(model_path)
-            try:
-                import subprocess
-                git_commit = subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
-                ).decode().strip()
-            except Exception:
-                git_commit = "unavailable"
-
-            metadata: Dict[str, Any] = {
-                "run_id": run_id,
-                "software_version": SOFTWARE_VERSION,
-                "analysis_mode": dispatcher.analysis_mode,
-                "git_commit": git_commit,
-                "execution_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "python_version": sys.version,
-                "os": platform.platform(),
-                "model_path": str(model_path),
-                "model_sha256": model_sha256,
-                "configuration_hash": cfg_hash,
-                "config_snapshot": str(config_snapshot_path),
-                "input_t1": _file_fingerprint(t1_scene),
-                "input_t2": _file_fingerprint(t2_scene),
-                "t1_date": t1_date,
-                "t2_date": t2_date,
-                "crs": str(ref_grid.crs) if ref_grid else None,
-                "resolution": list(ref_grid.resolution) if ref_grid else None,
-                "dimensions": [ref_grid.height, ref_grid.width] if ref_grid else None,
-                "total_runtime_seconds": time.perf_counter() - run_start,
-            }
-            _write_json(run_dir / "metadata.json", metadata)
-            outputs["metadata.json"] = "metadata.json"
-
-            # ==============================================================
-            # STEP 16 — Output manifest.json
-            # ==============================================================
-            run_logger.info("Step 16 — Writing output manifest")
-            manifest = {
-                "run_id": run_id,
-                "generated_utc": datetime.now(timezone.utc).isoformat(),
-                "total_outputs": len(outputs),
-                "outputs": [_output_entry(run_dir, rel) for rel in outputs.values()],
-            }
-            _write_json(run_dir / "manifest.json", manifest)
-            outputs["manifest.json"] = "manifest.json"
-
-            # ==============================================================
-            # Done
-            # ==============================================================
-            final_status = "WARNING" if warnings else "SUCCESS"
-            run_logger.info(
-                "Phase 13 — Pipeline COMPLETE. status=%s run_id=%s runtime=%.1fs",
-                final_status, run_id, time.perf_counter() - run_start,
-            )
+            (metadata, final_status,) = execute_stage(
+                "REPORTING", run_reporting)
 
             return AnalysisResult(
                 run_id=run_id,
@@ -1795,9 +1908,9 @@ class ProductionPipeline:
                 metadata={"run_id": run_id, "error": str(exc)},
             )
         finally:
-            if fh is not None:
-                fh.close()
-                logging.getLogger("gis_engine").removeHandler(fh)
+            for handler in handlers:
+                logging.getLogger("gis_engine").removeHandler(handler)
+                handler.close()
 
 
 def run_analysis(

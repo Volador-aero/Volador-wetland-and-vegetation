@@ -10,6 +10,7 @@ import sys
 import json
 import logging
 import io
+import os
 import time
 import shutil
 from datetime import datetime
@@ -27,6 +28,8 @@ ENGINE_SRC = Path(__file__).resolve().parent.parent / "Engine_module" / "src"
 if str(ENGINE_SRC) not in sys.path:
     sys.path.insert(0, str(ENGINE_SRC))
 
+from threading import RLock
+from gis_engine.core.checkpoints import Checkpoints, PLANS, fingerprint
 from gis_engine.api.service import analyze_wetland
 from gis_engine.ingestion.loader import RasterLoader
 from gis_engine.ingestion.validator import InputValidator
@@ -43,10 +46,45 @@ executor = ThreadPoolExecutor(max_workers=2)
 
 # In-memory run state tracking for fast polling + JSON persistence
 RUN_STATES: Dict[str, Dict[str, Any]] = {}
+RUN_INDEX_DIR = STORAGE_DIR / "run_index"
+TERMINAL_RUN_STATUSES = {"COMPLETED", "FAILED", "INTERRUPTED"}
 
 
 def now_iso() -> str:
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_json_atomically(path: Path, payload: Dict[str, Any]) -> None:
+    """Persist a small JSON record without exposing a partially-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary_path, path)
+
+
+def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            value = json.load(stream)
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _remove_run_indexes(runs_dir: Path) -> None:
+    """Remove direct lookup pointers when a project's run folders are removed."""
+    if not runs_dir.exists():
+        return
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        try:
+            (RUN_INDEX_DIR / f"{run_dir.name}.json").unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to remove run index for %s: %s", run_dir.name, exc)
 
 
 def _extract_date_from_directory(directory: Path) -> Optional[str]:
@@ -83,7 +121,30 @@ class ProjectStore:
             return {}
         try:
             with open(file_path, "r") as f:
-                return json.load(f)
+                projects = json.load(f)
+
+            # Project dataset directories are workspace-owned. Older project
+            # records may contain absolute paths from the machine where the
+            # repository was created, so rebuild them from the current
+            # STORAGE_DIR every time the registry is loaded.
+            changed = False
+            for project_id, project in projects.items():
+                project_root = STORAGE_DIR / "projects" / project_id
+                expected_paths = {
+                    "t1_dir": project_root / "datasets" / "t1",
+                    "t2_dir": project_root / "datasets" / "t2",
+                }
+                for key, expected_path in expected_paths.items():
+                    expected_path.mkdir(parents=True, exist_ok=True)
+                    expected_value = str(expected_path)
+                    if project.get(key) != expected_value:
+                        project[key] = expected_value
+                        changed = True
+
+            if changed:
+                cls.save_projects(projects)
+
+            return projects
         except Exception:
             return {}
 
@@ -150,6 +211,7 @@ class ProjectStore:
             del projects[project_id]
             cls.save_projects(projects)
             proj_dir = STORAGE_DIR / "projects" / project_id
+            _remove_run_indexes(proj_dir / "runs")
             if proj_dir.exists():
                 shutil.rmtree(proj_dir, ignore_errors=True)
             return True
@@ -207,6 +269,7 @@ class ProjectStore:
         )
 
         if runs_dir.exists():
+            _remove_run_indexes(runs_dir)
             for item in runs_dir.iterdir():
                 try:
                     if item.is_dir():
@@ -556,11 +619,111 @@ class DatasetService:
         }
 
 
+class ResumeConflict(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 class RunWorker:
     """Manages background async execution of the GIS engine pipeline."""
 
+    _resume_lock = RLock()
+
+    @staticmethod
+    def _state_path(output_dir: Path) -> Path:
+        return output_dir / "run_state.json"
+
+    @staticmethod
+    def _index_path(run_id: str) -> Path:
+        return RUN_INDEX_DIR / f"{run_id}.json"
+
     @classmethod
-    def start_run(cls, project_id: str, config_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _persist_state(cls, run_info: Dict[str, Any], output_dir: Path) -> None:
+        """Write lifecycle state once per stage transition, never per raster operation."""
+        run_info["updated_at"] = now_iso()
+        _write_json_atomically(cls._state_path(output_dir), run_info)
+
+    @classmethod
+    def _transition(
+        cls,
+        run_info: Dict[str, Any],
+        output_dir: Path,
+        *,
+        status: str,
+        progress: Optional[int] = None,
+        current_step: Optional[str] = None,
+        message: Optional[str] = None,
+        error: Optional[str] = None,
+        completed: bool = False,
+    ) -> None:
+        run_info["status"] = status
+        if progress is not None:
+            run_info["progress"] = progress
+        if current_step is not None:
+            run_info["current_step"] = current_step
+        if message is not None:
+            run_info["message"] = message
+        if error is not None:
+            run_info["error"] = error
+        if completed:
+            run_info["completed_at"] = now_iso()
+        cls._persist_state(run_info, output_dir)
+
+    @classmethod
+    def _run_dir_from_index(cls, run_id: str) -> Optional[Path]:
+        """Find new-format runs in O(1) without scanning every project folder."""
+        pointer = _read_json_object(cls._index_path(run_id))
+        if not pointer:
+            return None
+        output_directory = pointer.get("output_directory")
+        if not isinstance(output_directory, str):
+            return None
+        run_dir = Path(output_directory)
+        try:
+            storage_root = STORAGE_DIR.resolve()
+            if storage_root not in run_dir.resolve().parents:
+                return None
+        except OSError:
+            return None
+        return run_dir if cls._state_path(run_dir).is_file() else None
+
+    @classmethod
+    def _recover_durable_state(
+        cls, run_id: str, run_dir: Path, state: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        state.setdefault("run_id", run_id)
+        state.setdefault("output_directory", str(run_dir))
+        state.setdefault("progress", 0)
+        state.setdefault("current_step", "QUEUED")
+        state.setdefault("created_at", "")
+
+        if state.get("status") not in TERMINAL_RUN_STATUSES:
+            last_confirmed_step = state.get("current_step", "Unknown step")
+            state["last_confirmed_step"] = last_confirmed_step
+            cls._transition(
+                state,
+                run_dir,
+                status="INTERRUPTED",
+                current_step="INTERRUPTED",
+                message=(
+                    "Backend restart detected. Analysis was interrupted after "
+                    f"{last_confirmed_step}."
+                ),
+                completed=True,
+            )
+
+        RUN_STATES[run_id] = state
+        return state
+
+    @classmethod
+    def start_run(
+        cls,
+        project_id: str,
+        config_overrides: Optional[Dict[str, Any]] = None,
+        *,
+        retry_of: Optional[str] = None,
+    ) -> Dict[str, Any]:
         project = ProjectStore.get_project(project_id)
         if not project:
             raise ValueError(f"Project {project_id} not found")
@@ -589,10 +752,11 @@ class RunWorker:
             ProjectStore.save_preparation(project_id, prep)
             ProjectStore.update_project(project_id, {"preparation_status": "COMMITTED", "is_locked": True, "status": "PREPARATION_COMMITTED"})
 
-        run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
         runs_dir = STORAGE_DIR / "projects" / project_id / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
         run_output_dir = runs_dir / run_id
+        run_output_dir.mkdir(parents=True, exist_ok=False)
 
 
         run_info = {
@@ -606,10 +770,24 @@ class RunWorker:
             "completed_at": None,
             "message": "Analysis queued for background execution",
             "error": None,
-            "output_directory": str(run_output_dir)
+            "output_directory": str(run_output_dir),
+            "config_overrides": config_overrides or {},
+            "retry_of": retry_of,
+            "attempt_id": "attempt_1",
+            "checkpoints_enabled": os.getenv("ENABLE_STAGE_RESUME", "false").lower() in {"true", "1"},
         }
+        cls._persist_state(run_info, run_output_dir)
+        _write_json_atomically(
+            cls._index_path(run_id),
+            {
+                "run_id": run_id,
+                "project_id": project_id,
+                "output_directory": str(run_output_dir),
+            },
+        )
         RUN_STATES[run_id] = run_info
 
+        ProjectStore.update_project(project_id, {"latest_run_id": run_id})
         # Launch background task
         executor.submit(cls._execute_pipeline, run_id, project, run_output_dir, config_overrides)
         return run_info
@@ -618,9 +796,13 @@ class RunWorker:
     def _execute_pipeline(cls, run_id: str, project: Dict[str, Any], output_dir: Path, config_overrides: Optional[Dict[str, Any]]):
         run_info = RUN_STATES[run_id]
         run_info["started_at"] = now_iso()
-        run_info["status"] = "VALIDATING"
-        run_info["progress"] = 10
-        run_info["current_step"] = "Input Validation"
+        cls._transition(
+            run_info,
+            output_dir,
+            status="VALIDATING",
+            progress=10,
+            current_step="Input Validation",
+        )
 
         try:
             config_path = ENGINE_SRC.parent / "configs" / "config.json"
@@ -629,6 +811,9 @@ class RunWorker:
                 model_path = config_path
 
             # If caller supplied custom run configurations, write a runtime config snapshot
+            config_overrides = dict(config_overrides or {})
+            if not (config_overrides.get("analysis_mode") or config_overrides.get("analysisMode")):
+                config_overrides["analysis_mode"] = project.get("analysis_mode") or "wetland"
             if config_overrides and isinstance(config_overrides, dict):
                 try:
                     with open(config_path, "r", encoding="utf-8") as cf:
@@ -666,7 +851,7 @@ class RunWorker:
                         json.dump(base_cfg, cf, indent=2)
                     config_path = custom_cfg_path
                 except Exception as exc:
-                    logger.warning("Failed to write config_overrides snapshot: %s", exc)
+                    raise ValueError(f"Could not save the effective run configuration: {exc}") from exc
 
             t1_dir = Path(project["t1_dir"])
             t2_dir = Path(project["t2_dir"])
@@ -771,62 +956,176 @@ class RunWorker:
                     run_id,
                 )
 
-            run_info["status"] = "PREPROCESSING"
-            run_info["progress"] = 25
-            run_info["current_step"] = "Spatial Alignment & Preprocessing"
+            arguments = {
+                "t1_scene": str(t1_dir), "t2_scene": None if is_vegetation_mode else str(t2_dir),
+                "t1_date": t1_date or ("single-date" if is_vegetation_mode else None),
+                "t2_date": None if is_vegetation_mode else t2_date,
+                "config_path": str(config_path), "model_path": str(model_path),
+                "wetland_boundary": str(wetland_boundary) if wetland_boundary else None,
+            }
+            if run_info.get("checkpoints_enabled"):
+                run_info["checkpoint_arguments"] = arguments
+                run_info["checkpoint_signature"] = fingerprint(arguments)
+                run_info["checkpoint_mode"] = effective_mode
+                run_info["project_signature"] = cls._project_signature(project["id"])
+                cls._persist_state(run_info, output_dir)
+            cls._run_engine(run_info, output_dir, arguments, resume=False)
+        except Exception as exc:
+            cls._transition(run_info, output_dir, status="FAILED", completed=True, error=str(exc))
 
-            time.sleep(0.5)
-            run_info["status"] = "INFERENCE"
-            run_info["progress"] = 45
-            run_info["current_step"] = "Model Inference (5-Channel Sentinel-2)"
+    @staticmethod
+    def _project_signature(project_id):
+        p = ProjectStore.get_project(project_id) or {}
+        keys = ("analysis_mode", "t1_date", "t2_date", "wetland_boundary", "t1_dir", "t2_dir", "aoi_name")
+        values = {key: p.get(key) for key in keys}
+        prep = ProjectStore.load_preparation(project_id) or {}
+        values["geometry"] = [prep.get(key) for key in ("inclusion", "manual_exclusions", "is_locked")]
+        # Sample fallback must also detect newly uploaded user data.
+        values["datasets"] = [sorted((f.name, f.stat().st_size, f.stat().st_mtime_ns)
+                                     for f in Path(p[key]).glob("*") if f.is_file())
+                              for key in ("t1_dir", "t2_dir") if p.get(key)]
+        return json.dumps(values, sort_keys=True)
 
-            time.sleep(0.5)
-            run_info["status"] = "CHANGE_ANALYSIS"
-            run_info["progress"] = 65
-            run_info["current_step"] = "4x4 Transition Analysis & CVA"
+    @classmethod
+    def inspect_resume(cls, state):
+        blocked = {"resume_available": False}
+        if state.get("status") not in {"INTERRUPTED", "FAILED"}:
+            active = state.get("status") not in TERMINAL_RUN_STATUSES
+            return dict(blocked, code="RUN_ALREADY_ACTIVE" if active else "RUN_NOT_INTERRUPTED",
+                        resume_blocked_reason="Run is already active or completed")
+        try:
+            if not state.get("checkpoint_arguments"):
+                raise ResumeConflict("CHECKPOINT_NOT_FOUND", "This run has no stage checkpoints. Retry starts a fresh run.")
+            root = cls._run_dir_from_index(state["run_id"])
+            if not root or root != STORAGE_DIR / "projects" / state["project_id"] / "runs" / state["run_id"]:
+                raise ValueError("Run index does not match the project")
+            if cls._project_signature(state["project_id"]) != state.get("project_signature"):
+                raise ResumeConflict("CHECKPOINT_INCOMPATIBLE", "Project data or preparation changed. Start a fresh run.")
+            signature = fingerprint(state["checkpoint_arguments"])
+            if signature != state.get("checkpoint_signature"):
+                raise ResumeConflict("CHECKPOINT_INCOMPATIBLE", "Scientific inputs, configuration, model or code changed.")
+            store = Checkpoints(root, state["checkpoint_mode"], signature, resume=True)
+            stages = list(store.records)
+            if not stages:
+                raise ValueError("No valid stage checkpoint is available")
+            return {"resume_available": True, "resume_blocked_reason": None,
+                    "last_completed_stage": stages[-1],
+                    "next_stage": next((s for s in store.plan if s not in stages), "FINALIZE")}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return dict(blocked, code=getattr(exc, "code", "CHECKPOINT_CORRUPT"), resume_blocked_reason=str(exc))
 
-            # Execute real GIS analysis engine
-            res = analyze_wetland(
-                t1_scene=t1_dir,
-                t2_scene=None if is_vegetation_mode else t2_dir,
-                t1_date=t1_date if t1_date else ("single-date" if is_vegetation_mode else None),
-                t2_date=None if is_vegetation_mode else t2_date,
-                config_path=config_path,
-                model_path=model_path,
-                output_dir=output_dir.parent,
-                wetland_boundary=wetland_boundary,
-                run_id=run_id,
-            )
+    @classmethod
+    def resume_run(cls, run_id):
+        with cls._resume_lock:
+            state = cls.get_run_status(run_id)
+            if not state:
+                raise KeyError(run_id)
+            info = cls.inspect_resume(state)
+            if not info["resume_available"]:
+                raise ResumeConflict(info["code"], info["resume_blocked_reason"])
+            root = cls._run_dir_from_index(run_id)
+            count = state.get("resume_count", 0) + 1
+            state.update(info, resume_count=count, attempt_id=f"attempt_{count + 1}",
+                         completed_at=None, error=None, resume_available=False)
+            cls._transition(state, root, status="RESUMING", current_step="Loading checkpoint",
+                            message=f"Continuing from {info['last_completed_stage']}")
+            accepted = dict(state)
+            try:
+                executor.submit(cls._run_engine, state, root, state["checkpoint_arguments"], True)
+            except RuntimeError as exc:
+                cls._transition(state, root, status="INTERRUPTED", error=str(exc), completed=True)
+                raise
+            return accepted
 
-            run_info["status"] = "REPORTING"
-            run_info["progress"] = 90
-            run_info["current_step"] = "Generating PDF Cartographic Report"
+    @classmethod
+    def _run_engine(cls, run_info, output_dir, arguments, resume):
+        run_id = run_info["run_id"]
+        stages = {
+            "INPUT_VALIDATION": ("VALIDATING", 10), "PREPROCESSING": ("PREPROCESSING", 25),
+            "ALIGNMENT": ("ALIGNING", 25), "VEGETATION_INFERENCE": ("INFERENCE", 45),
+            "CHANGE_ANALYSIS": ("CHANGE_ANALYSIS", 65), "WETLAND_ANALYSIS": ("HYDROLOGY", 75),
+            "METRICS_QA": ("METRICS", 85), "REPORTING": ("REPORTING", 90),
+        }
+
+        def on_stage(stage):
+            status, progress = stages[stage]
+            label = stage.replace("_", " ").title()
+            if run_info.get("checkpoint_signature"):
+                plan = PLANS[run_info["checkpoint_mode"]]
+                index = plan.index(stage)
+                run_info["last_completed_stage"] = plan[index - 1] if index else None
+                run_info["next_stage"] = stage
+            cls._transition(run_info, output_dir, status=status, progress=progress,
+                            current_step=label, message=label)
+
+        try:
+            res = analyze_wetland(**arguments, output_dir=output_dir.parent, run_id=run_id,
+                                  checkpoint_signature=run_info.get("checkpoint_signature"),
+                                  resume=resume, stage_callback=on_stage)
 
             if res.status in ["SUCCESS", "WARNING"]:
-                run_info["status"] = "COMPLETED"
-                run_info["progress"] = 100
-                run_info["current_step"] = "COMPLETED"
-                run_info["completed_at"] = now_iso()
-                run_info["message"] = "Analysis completed successfully"
-                ProjectStore.update_project(project["id"], {"latest_run_id": run_id, "status": "ANALYZED"})
+                if run_info.get("checkpoint_signature"):
+                    run_info.update(last_completed_stage="REPORTING", next_stage=None)
+                cls._transition(
+                    run_info,
+                    output_dir,
+                    status="COMPLETED",
+                    progress=100,
+                    current_step="COMPLETED",
+                    message="Analysis completed successfully",
+                    completed=True,
+                )
+                current = ProjectStore.get_project(run_info["project_id"])
+                if current and current.get("latest_run_id") == run_id:
+                    ProjectStore.update_project(run_info["project_id"], {"status": "ANALYZED"})
             else:
-                run_info["status"] = "FAILED"
-                run_info["completed_at"] = now_iso()
-                run_info["error"] = "; ".join(res.errors) if res.errors else "Pipeline execution failed"
+                cls._transition(
+                    run_info,
+                    output_dir,
+                    status="FAILED",
+                    error="; ".join(res.errors) if res.errors else "Pipeline execution failed",
+                    completed=True,
+                )
 
         except Exception as e:
             logger.exception("Pipeline execution failed for run %s", run_id)
-            run_info["status"] = "FAILED"
-            run_info["completed_at"] = now_iso()
-            run_info["error"] = str(e)
+            try:
+                cls._transition(
+                    run_info,
+                    output_dir,
+                    status="FAILED",
+                    error=str(e),
+                    completed=True,
+                )
+            except OSError:
+                run_info["status"] = "FAILED"
+                run_info["completed_at"] = now_iso()
+                run_info["error"] = str(e)
+
+    @classmethod
+    def retry_run(cls, run_id: str) -> Dict[str, Any]:
+        previous_run = cls.get_run_status(run_id)
+        if not previous_run:
+            raise ValueError(f"Run {run_id} not found")
+        if previous_run.get("status") not in {"FAILED", "INTERRUPTED"}:
+            raise ValueError("Only failed or interrupted runs can be retried")
+
+        config_overrides = previous_run.get("config_overrides")
+        if not isinstance(config_overrides, dict):
+            config_overrides = None
+        return cls.start_run(
+            previous_run["project_id"],
+            config_overrides,
+            retry_of=run_id,
+        )
 
     @classmethod
     def get_run_status(cls, run_id: str) -> Optional[Dict[str, Any]]:
         """
-        Return run status from in-memory state when available.
+        Return run status from memory, then direct durable lookup.
 
-        Completed runs must remain discoverable after a backend restart/reload,
-        so fall back to the persistent run directory and manifest.json.
+        New runs use a small run-id index followed by run_state.json, so normal
+        restart recovery is O(1) and does not scan every project directory.
         """
 
         # Fast path for currently running / recently completed runs.
@@ -834,8 +1133,31 @@ class RunWorker:
         if run_info is not None:
             return run_info
 
-        # Persistent recovery path.
-        # A run directory is authoritative evidence that the run exists.
+        indexed_run_dir = cls._run_dir_from_index(run_id)
+        if indexed_run_dir is not None:
+            durable_state = _read_json_object(cls._state_path(indexed_run_dir))
+            if durable_state is not None:
+                with cls._resume_lock:
+                    return RUN_STATES.get(run_id) or cls._recover_durable_state(run_id, indexed_run_dir, durable_state)
+
+            recovery_error = {
+                "run_id": run_id,
+                "project_id": "",
+                "status": "FAILED",
+                "progress": 0,
+                "current_step": "RECOVERY_ERROR",
+                "created_at": "",
+                "started_at": None,
+                "completed_at": now_iso(),
+                "message": "Run state could not be recovered from persistent storage.",
+                "error": "run_state.json is missing or unreadable.",
+                "output_directory": str(indexed_run_dir),
+            }
+            RUN_STATES[run_id] = recovery_error
+            return recovery_error
+
+        # Legacy recovery path for runs created before durable run state was
+        # introduced. New runs never use this O(project-count) directory scan.
         projects_dir = STORAGE_DIR / "projects"
 
         if not projects_dir.exists():
