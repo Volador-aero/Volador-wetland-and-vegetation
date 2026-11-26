@@ -61,7 +61,7 @@ def generate_assistant_response(
     to OpenRouter and return its generated response.
     """
 
-    if not OPENROUTER_API_KEY:
+    if not OPENROUTER_API_KEY or not OPENROUTER_API_KEY.strip():
         raise RuntimeError("OPENROUTER_API_KEY is not configured.")
 
     user_message = f"User question:\n{question}"

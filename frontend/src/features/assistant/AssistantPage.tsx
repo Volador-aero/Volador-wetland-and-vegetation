@@ -141,15 +141,35 @@ export default function AssistantPage() {
           content: response.answer,
         },
       ]);
+      try {
+        const status = await getAssistantStatus();
+        setAssistantStatus(status);
+        setStatusUnavailable(false);
+      } catch {
+        setAssistantStatus(null);
+        setStatusUnavailable(true);
+      }
+   
     } catch (err) {
-      setError(
+      const errorMessage =
         err instanceof Error
           ? err.message
-          : "Unable to connect to the AI Assistant.",
-      );
+          : "Unable to connect to the AI Assistant.";
+
+      setError(errorMessage);
+
+      if (
+        errorMessage.startsWith(
+          "Unable to connect to the AI Assistant."
+        )
+      ) {
+        setAssistantStatus(null);
+        setStatusUnavailable(true);
+      }
     } finally {
       setLoading(false);
     }
+
   };
 
   const handleSuggestion = (suggestion: string) => {
@@ -158,24 +178,27 @@ export default function AssistantPage() {
 
   const statusLabel = !assistantStatus
     ? statusUnavailable
-      ? "Status unavailable"
+      ? "Connection unavailable"
       : "Checking..."
     : assistantStatus.configured
       ? "Ready"
       : "Not configured";
 
   const statusColor = !assistantStatus
-    ? "text-[var(--text-secondary)]"
+    ? statusUnavailable
+      ? "text-red-500"
+      : "text-[var(--text-secondary)]"
     : assistantStatus.configured
       ? "text-[var(--success)]"
       : "text-amber-500";
 
   const statusDotColor = !assistantStatus
-    ? "bg-[var(--text-secondary)]"
+    ? statusUnavailable
+      ? "bg-red-500"
+      : "bg-[var(--text-secondary)]"
     : assistantStatus.configured
       ? "bg-[var(--success)]"
       : "bg-amber-500";
-
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)]">
       <div className="flex items-center gap-3 border-b border-[var(--border)] p-5">
