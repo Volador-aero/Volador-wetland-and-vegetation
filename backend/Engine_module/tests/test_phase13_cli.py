@@ -162,7 +162,7 @@ def test_cli_successful_run():
             "--t1-date", "2026-08-01",
             "--t2-date", "2026-08-15",
             "--config", str(config_path),
-            "--model", str(t1_dir / "scene_G.tif"),  # dummy model file path
+            "--model", str(_create_valid_qa_model(tmp_path)),  # dummy model file path
             "--output", str(output_dir),
             "--run-id", "cli_success_test_run"
         ]
@@ -195,7 +195,7 @@ def test_cli_validation_exit_code():
             "--t1-date", "2026-08-15",
             "--t2-date", "2026-08-01",  # earlier
             "--config", str(config_path),
-            "--model", str(t1_dir / "scene_G.tif"),
+            "--model", str(_create_valid_qa_model(tmp_path)),
             "--output", str(output_dir),
             "--run-id", "cli_val_fail"
         ]
@@ -223,7 +223,7 @@ def test_cli_config_exit_code():
             "--t1-date", "2026-08-01",
             "--t2-date", "2026-08-15",
             "--config", str(tmp_path / "does_not_exist.json"),
-            "--model", str(t1_dir / "scene_G.tif"),
+            "--model", str(_create_valid_qa_model(tmp_path)),
             "--output", str(output_dir),
             "--run-id", "cli_config_fail"
         ]
@@ -231,3 +231,70 @@ def test_cli_config_exit_code():
         with patch.object(sys, 'argv', test_args):
             exit_code = run_analysis.main()
             assert exit_code == 2  # 2 = ConfigurationError exit code
+
+
+def _create_valid_qa_model(directory):
+    """Create a valid synthetic ONNX model for mocked integration tests."""
+
+    import numpy as np
+    import onnx
+
+    from onnx import helper, TensorProto, numpy_helper
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    model_path = directory / "qa_test_model.onnx"
+
+    model_input = helper.make_tensor_value_info(
+        "input",
+        TensorProto.FLOAT,
+        [1, 5, "height", "width"],
+    )
+
+    model_output = helper.make_tensor_value_info(
+        "output",
+        TensorProto.FLOAT,
+        [1, 4, "height", "width"],
+    )
+
+    weights = numpy_helper.from_array(
+        np.zeros((4, 5, 1, 1), dtype=np.float32),
+        name="weights",
+    )
+
+    bias = numpy_helper.from_array(
+        np.array([0, 0, 0, 10], dtype=np.float32),
+        name="bias",
+    )
+
+    convolution = helper.make_node(
+        "Conv",
+        ["input", "weights", "bias"],
+        ["output"],
+        kernel_shape=[1, 1],
+    )
+
+    graph = helper.make_graph(
+        [convolution],
+        "synthetic_qa_test_model",
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13)
+        ],
+        producer_name="integration-test-fixture",
+    )
+
+    model.ir_version = 8
+
+    onnx.checker.check_model(model)
+
+    onnx.save(model, str(model_path))
+
+    return model_path

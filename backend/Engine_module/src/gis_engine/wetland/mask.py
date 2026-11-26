@@ -131,6 +131,10 @@ def build_wetland_mask(
     # 2. Build raw wetland mask
     raw_mask = np.zeros((reference_grid.height, reference_grid.width), dtype=np.uint8)
     
+    # Track observation coverage separately from membership.
+    source_valid_mask = np.ones(raw_mask.shape, dtype=bool)
+    optical_change_map = None
+
     # Rasterization configurations
     rasterization_config = wetland_config.get("rasterization", {})
     all_touched = rasterization_config.get("all_touched", False)
@@ -138,9 +142,14 @@ def build_wetland_mask(
     if final_source_type == "PROJECT_BOUNDARY":
         selected_source_type = "PROJECT_BOUNDARY"
         selected_status = "WETLAND_BOUNDARY_AVAILABLE"
-        depletion_enabled = wetland_config.get("depletion_claims", {}).get("enabled", False)
+        depletion_enabled = False
         
         geoms, src_crs = load_vector_boundary(Path(boundary_path))
+
+        if not geoms:
+            raise ValueError(
+                "Project boundary contains no usable geometry."
+            )
         reprojected_geoms = [reproject_geometry(g, src_crs, reference_grid.crs) for g in geoms]
         
         if reprojected_geoms:
@@ -162,7 +171,7 @@ def build_wetland_mask(
     elif final_source_type == "OFFICIAL_DATASET":
         selected_source_type = "OFFICIAL_DATASET"
         selected_status = "WETLAND_BOUNDARY_AVAILABLE"
-        depletion_enabled = wetland_config.get("depletion_claims", {}).get("enabled", False)
+        depletion_enabled = False
         
         dataset_config = wetland_config.get("official_dataset", {})
         classes = dataset_config.get("classes", [])
@@ -174,6 +183,17 @@ def build_wetland_mask(
             select_classes=classes if classes else None
         )
         
+        if not geoms:
+
+            if classes and class_field:
+                raise ValueError(
+                    "Dataset class semantics require configuration."
+                )
+
+            raise ValueError(
+                "Official dataset contains no selected geometry."
+            )
+
         reprojected_geoms = [reproject_geometry(g, src_crs, reference_grid.crs) for g in geoms]
         
         if reprojected_geoms:
@@ -200,54 +220,142 @@ def build_wetland_mask(
         }
         
     elif final_source_type == "JRC_WATER_CONTEXT":
+
         selected_source_type = "JRC_WATER_CONTEXT"
         selected_status = "WETLAND_EXTENT_INFERRED"
         depletion_enabled = False
-        
+
         jrc_path_resolved = Path(jrc_path) if jrc_path else None
-        if jrc_path_resolved and jrc_path_resolved.is_file():
+
+        source_metadata = {
+            "dataset_name": "JRC Global Surface Water",
+            "layer_used": "occurrence",
+            "threshold_criterion": ">10%",
+            "processing_method": "hydrological/water-history context",
+        }
+
+        try:
+
+            if (
+                jrc_path_resolved is None
+                or not jrc_path_resolved.is_file()
+            ):
+                raise ValueError("JRC occurrence raster unavailable.")
+
             with rasterio.open(jrc_path_resolved) as src:
+
+                if src.count != 1:
+                    raise ValueError(
+                        "JRC occurrence raster must contain one band."
+                    )
+
+                if src.crs is None or reference_grid.crs is None:
+                    raise ValueError(
+                        "JRC and reference grid require valid CRS."
+                    )
+
+                if src.width <= 0 or src.height <= 0:
+                    raise ValueError("Invalid JRC raster dimensions.")
+
+                coefficients = np.asarray(
+                    tuple(src.transform)[:6],
+                    dtype=np.float64,
+                )
+
+                if (
+                    not np.all(np.isfinite(coefficients))
+                    or src.transform.a * src.transform.e
+                    - src.transform.b * src.transform.d == 0
+                ):
+                    raise ValueError("Invalid JRC raster transform.")
+
                 jrc_data = src.read(1)
-                jrc_transform = src.transform
-                jrc_crs = src.crs
-                jrc_nodata = src.nodata
-                
-            jrc_aligned = np.zeros((reference_grid.height, reference_grid.width), dtype=jrc_data.dtype)
-            reproject(
-                source=jrc_data,
-                destination=jrc_aligned,
-                src_transform=jrc_transform,
-                src_crs=jrc_crs,
-                dst_transform=reference_grid.transform,
-                dst_crs=reference_grid.crs,
-                src_nodata=jrc_nodata,
-                dst_nodata=0,
-                resampling=Resampling.nearest
-            )
-            # Threshold persistence: e.g. persistence > 10%
-            water_mask = (jrc_aligned > 10) & (jrc_aligned <= 100)
-            raw_mask = np.where(water_mask, 1, 0).astype(np.uint8)
-            source_metadata = {
+
+                if jrc_data.dtype.kind not in "iuf":
+                    raise ValueError("Unsupported JRC raster data type.")
+
+                valid = (
+                    (src.read_masks(1) > 0)
+                    & np.isfinite(jrc_data)
+                    & (jrc_data >= 0)
+                    & (jrc_data <= 100)
+                )
+
+                if src.nodata is not None:
+                    valid &= jrc_data != src.nodata
+
+                # Preserve zero as a valid occurrence observation.
+                # Use a separate sentinel for unknown observations.
+                jrc_values = np.full(
+                    jrc_data.shape,
+                    -9999.0,
+                    dtype=np.float32,
+                )
+
+                jrc_values[valid] = jrc_data[valid]
+
+                jrc_aligned = np.full(
+                    raw_mask.shape,
+                    -9999.0,
+                    dtype=np.float32,
+                )
+
+                reproject(
+                    source=jrc_values,
+                    destination=jrc_aligned,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=reference_grid.transform,
+                    dst_crs=reference_grid.crs,
+                    src_nodata=-9999.0,
+                    dst_nodata=-9999.0,
+                    resampling=Resampling.nearest,
+                )
+
+                source_valid_mask = (
+                    np.isfinite(jrc_aligned)
+                    & (jrc_aligned >= 0)
+                    & (jrc_aligned <= 100)
+                )
+
+                source_metadata["original_crs"] = str(src.crs)
+
+            if not np.any(source_valid_mask):
+                raise ValueError(
+                    "No valid JRC observations intersect the reference grid."
+                )
+
+            raw_mask = (
+                source_valid_mask & (jrc_aligned > 10)
+            ).astype(np.uint8)
+
+            source_metadata.update({
                 "source_name": jrc_path_resolved.name,
-                "dataset_name": "JRC Global Surface Water",
-                "layer_used": "occurrence",
-                "threshold_criterion": ">10%",
-                "processing_method": "hydrological/water-history context"
-            }
-        else:
-            # Fallback or synthetic JRC for tests
-            raw_mask = np.zeros((reference_grid.height, reference_grid.width), dtype=np.uint8)
-            source_metadata = {
-                "dataset_name": "JRC Global Surface Water",
-                "status": "unavailable or using fallback context"
-            }
-            
+                "source_path": str(jrc_path_resolved),
+                "status": "JRC water-history context available.",
+                "authoritative_wetland_boundary": False,
+            })
+
+        except Exception as exc:
+
+            selected_source_type = "UNAVAILABLE"
+            selected_status = "WETLAND_BOUNDARY_UNAVAILABLE"
+
+            raw_mask = np.zeros(raw_mask.shape, dtype=np.uint8)
+            source_valid_mask = np.zeros(raw_mask.shape, dtype=bool)
+
+            source_metadata.update({
+                "status": "JRC water-history context unavailable.",
+                "failure_type": type(exc).__name__,
+            })
+
     elif final_source_type == "OPTICAL_WATER_INFERENCE":
         selected_source_type = "OPTICAL_WATER_INFERENCE"
         selected_status = "WETLAND_EXTENT_INFERRED"
         depletion_enabled = False
         
         threshold = wetland_config.get("optical", {}).get("threshold", 0.1)
+        optical_failure_type = None
         
         # Load green/nir bands for T1 and T2
         t1_water = np.zeros((reference_grid.height, reference_grid.width), dtype=bool)
@@ -274,51 +382,112 @@ def build_wetland_mask(
         t2_nir = t2_dir / "nir.tif"
         
         try:
-            if t1_green.is_file() and t1_nir.is_file():
-                t1_water, _ = classify_optical_water(t1_green, t1_nir, threshold=threshold)
-            if t2_green.is_file() and t2_nir.is_file():
-                t2_water, _ = classify_optical_water(t2_green, t2_nir, threshold=threshold)
-                
-            raw_mask = np.where(t1_water | t2_water, 1, 0).astype(np.uint8)
-            
-            # Optional: generate wetland extent change if both date masks are available
-            if output_dir and t1_green.is_file() and t2_green.is_file():
-                change_map = np.zeros_like(raw_mask)
-                change_map[~t1_water & ~t2_water] = 0
-                change_map[t1_water & t2_water] = 1
-                change_map[~t1_water & t2_water] = 2
-                change_map[t1_water & ~t2_water] = 3
-                
-                # Write to disk
-                out_p = Path(output_dir)
-                out_p.mkdir(parents=True, exist_ok=True)
-                
-                profile = {
-                    "driver": "GTiff",
-                    "dtype": "uint8",
-                    "nodata": 255,
-                    "width": reference_grid.width,
-                    "height": reference_grid.height,
-                    "count": 1,
-                    "crs": reference_grid.crs,
-                    "transform": reference_grid.transform,
-                    "compress": "lzw"
-                }
-                with rasterio.open(out_p / "wetland_extent_change.tif", "w", **profile) as dst:
-                    dst.write(change_map, 1)
+            required_bands = (
+                t1_green,
+                t1_nir,
+                t2_green,
+                t2_nir,
+            )
+
+            if not all(p.is_file() for p in required_bands):
+                raise ValueError(
+                    "Required optical inference bands are missing."
+                )
+
+            for band_path in required_bands:
+
+                with rasterio.open(band_path) as src:
+
+                    if (
+                        src.count != 1
+                        or src.width != reference_grid.width
+                        or src.height != reference_grid.height
+                        or src.crs != reference_grid.crs
+                        or src.transform != reference_grid.transform
+                    ):
+                        raise ValueError(
+                            "Optical raster does not match the reference grid."
+                        )
+
+            t1_water, t1_valid = classify_optical_water(
+                t1_green,
+                t1_nir,
+                threshold=threshold,
+            )
+
+            t2_water, t2_valid = classify_optical_water(
+                t2_green,
+                t2_nir,
+                threshold=threshold,
+            )
+
+            source_valid_mask = t1_valid & t2_valid
+
+            if not np.any(source_valid_mask):
+                raise ValueError("No common valid optical observations.")
+
+            raw_mask = (
+                (t1_water | t2_water) & source_valid_mask
+            ).astype(np.uint8)
+
+            # Retain the existing transition class mapping.
+            optical_change_map = np.full(
+                raw_mask.shape,
+                255,
+                dtype=np.uint8,
+            )
+
+            optical_change_map[
+                source_valid_mask & ~t1_water & ~t2_water
+            ] = 0
+
+            optical_change_map[
+                source_valid_mask & t1_water & t2_water
+            ] = 1
+
+            optical_change_map[
+                source_valid_mask & ~t1_water & t2_water
+            ] = 2
+
+            optical_change_map[
+                source_valid_mask & t1_water & ~t2_water
+            ] = 3
+
         except Exception as e:
-            raw_mask = np.zeros((reference_grid.height, reference_grid.width), dtype=np.uint8)
+
+            source_valid_mask = np.zeros(
+                raw_mask.shape,
+                dtype=bool,
+            )
+
+            optical_change_map = None
+            optical_failure_type = type(e).__name__
+
+            selected_source_type = "UNAVAILABLE"
+            selected_status = "WETLAND_BOUNDARY_UNAVAILABLE"
+
+            raw_mask = np.zeros(
+                (reference_grid.height, reference_grid.width),
+                dtype=np.uint8,
+            )
             
         source_metadata = {
             "source_name": "Local Optical Water Classifier",
             "threshold": threshold,
             "index": "NDWI",
-            "status": "Wetland extent inferred from water evidence; not an authoritative wetland boundary."
+            "failure_type": optical_failure_type,
+            "common_temporal_observations_required": True,
+            "authoritative_wetland_boundary": False,
+            "status": (
+                "Optical inference unavailable."
+                if selected_source_type == "UNAVAILABLE"
+                else "Wetland extent inferred from water evidence; not an authoritative wetland boundary."
+            )
         }
         
     elif final_source_type == "SAR_INFERENCE":
-        selected_source_type = "SAR_INFERENCE"
-        selected_status = "WETLAND_EXTENT_INFERRED"
+        selected_source_type = "UNAVAILABLE"
+        selected_status = "WETLAND_BOUNDARY_UNAVAILABLE"
         depletion_enabled = False
         source_metadata = {
             "source_name": "SAR water/inundation information",
@@ -335,6 +504,36 @@ def build_wetland_mask(
         }
         raw_mask = np.ones((reference_grid.height, reference_grid.width), dtype=np.uint8)
 
+    def validate_binary_mask(mask, name):
+
+        expected_shape = (
+            reference_grid.height,
+            reference_grid.width,
+        )
+
+        if not isinstance(mask, np.ndarray):
+            raise ValueError(
+                f"{name} must be a NumPy array."
+            )
+
+        if mask.ndim != 2 or mask.shape != expected_shape:
+            raise ValueError(
+                f"{name} shape must match the reference grid."
+            )
+
+        if mask.dtype.kind not in "biuf":
+            raise ValueError(
+                f"{name} has an unsupported data type."
+            )
+
+        if not np.all(np.isin(mask, [0, 1, 255])):
+            raise ValueError(
+                f"{name} contains invalid mask values."
+            )
+
+        # Treat explicit NoData as excluded, never valid.
+        return (mask == 1).astype(np.uint8)
+
     # 3. Resolve overlap mask and AOI
     # Resolving overlap mask
     o_mask = None
@@ -343,13 +542,30 @@ def build_wetland_mask(
             o_mask = overlap_mask
         else:
             with rasterio.open(overlap_mask) as src:
-                o_mask = src.read(1)
+
+                if (
+                    src.count != 1
+                    or src.width != reference_grid.width
+                    or src.height != reference_grid.height
+                    or src.crs != reference_grid.crs
+                    or src.transform != reference_grid.transform
+                ):
+                    raise ValueError(
+                        "Overlap raster must match the reference grid."
+                    )
+
+                o_mask = src.read(1, masked=True).filled(0)
     else:
         # No overlap mask provided — default to all-valid.
         # The production pipeline always passes an explicit overlap_mask;
         # this fallback exists only for stand-alone/test use.
         o_mask = np.ones((reference_grid.height, reference_grid.width), dtype=np.uint8)
             
+    o_mask = validate_binary_mask(
+        o_mask,
+        "Overlap mask",
+    )
+
     # Resolve AOI mask
     aoi_mask = None
     if aoi is not None:
@@ -360,6 +576,11 @@ def build_wetland_mask(
             if aoi_path.suffix.lower() in (".shp", ".geojson", ".json"):
                 # Vector AOI boundary
                 aoi_geoms, aoi_crs = load_vector_boundary(aoi_path)
+
+                if not aoi_geoms:
+                    raise ValueError(
+                        "AOI contains no usable geometry."
+                    )
                 aoi_rep_geoms = [reproject_geometry(g, aoi_crs, reference_grid.crs) for g in aoi_geoms]
                 if aoi_rep_geoms:
                     aoi_mask = rasterize(
@@ -373,8 +594,36 @@ def build_wetland_mask(
             else:
                 # Raster AOI
                 with rasterio.open(aoi_path) as src:
-                    aoi_data = src.read(1)
-                    if src.crs != reference_grid.crs or src.transform != reference_grid.transform:
+                    if src.count != 1:
+                        raise ValueError(
+                            "AOI raster must contain one band."
+                        )
+
+                    aoi_data = src.read(
+                        1,
+                        masked=True,
+                    ).filled(0)
+
+                    if (
+                        aoi_data.dtype.kind not in "biuf"
+                        or not np.all(
+                            np.isin(aoi_data, [0, 1, 255])
+                        )
+                    ):
+                        raise ValueError(
+                            "AOI raster contains invalid mask values."
+                        )
+
+                    aoi_data = (
+                        aoi_data == 1
+                    ).astype(np.uint8)
+
+                    if (
+                        src.crs != reference_grid.crs
+                        or src.transform != reference_grid.transform
+                        or src.width != reference_grid.width
+                        or src.height != reference_grid.height
+                    ):
                         aoi_mask = np.zeros((reference_grid.height, reference_grid.width), dtype=np.uint8)
                         reproject(
                             source=aoi_data,
@@ -383,7 +632,7 @@ def build_wetland_mask(
                             src_crs=src.crs,
                             dst_transform=reference_grid.transform,
                             dst_crs=reference_grid.crs,
-                            src_nodata=src.nodata,
+                            src_nodata=0,
                             dst_nodata=0,
                             resampling=Resampling.nearest
                         )
@@ -391,12 +640,118 @@ def build_wetland_mask(
                         aoi_mask = aoi_data
                         
     if aoi_mask is None:
-        aoi_mask = np.ones((reference_grid.height, reference_grid.width), dtype=np.uint8)
+
+        if aoi is not None:
+            raise ValueError(
+                "Provided AOI could not be resolved."
+            )
+
+        aoi_mask = np.ones(
+            (reference_grid.height, reference_grid.width),
+            dtype=np.uint8,
+        )
+
+    aoi_mask = validate_binary_mask(
+        aoi_mask,
+        "AOI mask",
+    )
+
+    raw_mask = validate_binary_mask(
+        raw_mask,
+        "Wetland membership mask",
+    )
         
+    # Unavailable membership must never represent the
+    # entire analysis region as confirmed wetland.
+    if selected_source_type == "UNAVAILABLE":
+
+        raw_mask = np.zeros(
+            (reference_grid.height, reference_grid.width),
+            dtype=np.uint8,
+        )
+
+        depletion_enabled = False
+
     # 4. Integrate validity and NoData
     # Raw wetland mask represents spatial wetland membership (0 = outside, 1 = inside)
     # Valid analysis mask restricts raw mask to valid overlap and AOI
-    valid_data_mask = (o_mask == 1) & (aoi_mask == 1)
+    requested_analysis_mask = (o_mask == 1) & (aoi_mask == 1)
+
+    if selected_source_type == "UNAVAILABLE":
+        source_valid_mask = np.zeros(raw_mask.shape, dtype=bool)
+
+    requested_pixel_count = int(
+        np.count_nonzero(requested_analysis_mask)
+    )
+
+    observed_pixel_count = int(
+        np.count_nonzero(
+            requested_analysis_mask & source_valid_mask
+        )
+    )
+
+    inferred_source = selected_source_type in (
+        "JRC_WATER_CONTEXT",
+        "OPTICAL_WATER_INFERENCE",
+    )
+
+    if inferred_source and observed_pixel_count == 0:
+
+        source_metadata["status"] = (
+            "No valid source observations inside the analysis region."
+        )
+
+        selected_source_type = "UNAVAILABLE"
+        selected_status = "WETLAND_BOUNDARY_UNAVAILABLE"
+
+        raw_mask = np.zeros(raw_mask.shape, dtype=np.uint8)
+        source_valid_mask = np.zeros(raw_mask.shape, dtype=bool)
+
+        optical_change_map = None
+        depletion_enabled = False
+
+    valid_data_mask = (
+        requested_analysis_mask & source_valid_mask
+    )
+
+    if optical_change_map is not None:
+        optical_change_map[~valid_data_mask] = 255
+
+    if selected_source_type == "UNAVAILABLE":
+        coverage_status = "UNAVAILABLE"
+    elif requested_pixel_count == 0:
+        coverage_status = "NOT_AVAILABLE"
+    elif observed_pixel_count == requested_pixel_count:
+        coverage_status = "COMPLETE"
+    else:
+        coverage_status = "PARTIAL"
+
+    observation_coverage = {
+        "status": coverage_status,
+        "requested_pixel_count": requested_pixel_count,
+        "observed_pixel_count": observed_pixel_count,
+        "unknown_pixel_count": (
+            requested_pixel_count - observed_pixel_count
+        ),
+        "coverage_fraction": (
+            observed_pixel_count / requested_pixel_count
+            if requested_pixel_count > 0
+            else None
+        ),
+        "grid_observed_pixel_count": int(
+            np.count_nonzero(source_valid_mask)
+        ),
+        "grid_pixel_count": int(source_valid_mask.size),
+        "basis": (
+            "SOURCE_OBSERVATIONS"
+            if inferred_source
+            else "BOUNDARY_MEMBERSHIP"
+            if selected_source_type != "UNAVAILABLE"
+            else "UNAVAILABLE"
+        ),
+    }
+
+    source_metadata["observation_coverage"] = observation_coverage
     
     # Raw wetland mask
     final_wetland_mask = raw_mask.copy().astype(np.uint8)
@@ -440,14 +795,27 @@ def build_wetland_mask(
         valid_area_m2 = None
         valid_area_ha = None
 
+    if selected_source_type == "UNAVAILABLE":
+
+        wetland_area_m2 = None
+        wetland_area_ha = None
+        valid_area_m2 = None
+        valid_area_ha = None
+
+        wetland_pixel_count = None
+        valid_pixel_count = None
+
+        physical_area_available = False
+        area_basis = "unavailable"
+
     # 6. Save outputs if output_dir is provided
     # Build complete metadata dictionary
     metadata = {
         "source_type": selected_source_type,
         "source_name": source_metadata.get("source_name", "None"),
-        "source_version": source_metadata.get("source_version", "1.0"),
-        "source_date": source_metadata.get("source_date", "2023-08-14"),
-        "source_authority": source_metadata.get("source_authority", "None"),
+        "source_version": source_metadata.get("source_version"),
+        "source_date": source_metadata.get("source_date"),
+        "source_authority": source_metadata.get("source_authority"),
         "original_crs": source_metadata.get("original_crs", str(reference_grid.crs)),
         "target_crs": str(reference_grid.crs),
         "rasterization_method": "rasterio.features.rasterize",
@@ -467,6 +835,42 @@ def build_wetland_mask(
         "physical_area_available": physical_area_available,
         "area_basis": area_basis,
         "confidence_status": selected_status,
+        "observation_coverage": observation_coverage,
+        "area_is_observed_membership_only": (
+            selected_source_type in (
+                "JRC_WATER_CONTEXT",
+                "OPTICAL_WATER_INFERENCE",
+            )
+        ),
+        "wetland_membership_verified": False,
+        "authoritative_boundary_source": (
+            selected_source_type in (
+                "PROJECT_BOUNDARY",
+                "OFFICIAL_DATASET",
+            )
+        ),
+        "boundary_available": (
+            selected_source_type in (
+                "PROJECT_BOUNDARY",
+                "OFFICIAL_DATASET",
+            )
+        ),
+        "wetland_context_available": (
+            selected_source_type != "UNAVAILABLE"
+        ),
+        "wetland_metrics_available": (
+            selected_source_type != "UNAVAILABLE"
+        ),
+        "analysis_scope": (
+            "UNAVAILABLE"
+            if selected_source_type == "UNAVAILABLE"
+            else "AUTHORITATIVE_BOUNDARY"
+            if selected_source_type in (
+                "PROJECT_BOUNDARY",
+                "OFFICIAL_DATASET",
+            )
+            else "INFERRED_WATER_CONTEXT"
+        ),
         "physical_wetland_depletion_enabled": depletion_enabled,
         "source_metadata": source_metadata
     }
@@ -494,6 +898,22 @@ def build_wetland_mask(
         with rasterio.open(output_dir / "valid_wetland_analysis_mask.tif", "w", **profile) as dst:
             dst.write(final_analysis_mask, 1)
             
+        with rasterio.open(
+            output_dir / "wetland_source_validity.tif",
+            "w",
+            **profile,
+        ) as dst:
+            dst.write(source_valid_mask.astype(np.uint8), 1)
+
+        if optical_change_map is not None:
+
+            with rasterio.open(
+                output_dir / "wetland_extent_change.tif",
+                "w",
+                **profile,
+            ) as dst:
+                dst.write(optical_change_map, 1)
+
         with open(output_dir / "wetland_metadata.json", "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=4)
 

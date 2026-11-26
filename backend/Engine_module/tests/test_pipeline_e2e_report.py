@@ -64,7 +64,7 @@ def test_pipeline_e2e_produces_pdf_and_maps(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=str(_config_path),
-        model_path=t1_dir / "scene_G.tif",  # dummy model path
+        model_path=_create_valid_qa_model(tmp_path),  # dummy model path
         output_dir=out_dir,
     )
 
@@ -88,3 +88,70 @@ def test_pipeline_e2e_produces_pdf_and_maps(mock_predict, mock_load, tmp_path):
     assert "reports/FINAL_ANALYSIS_REPORT.pdf" in result.outputs
     manifest_p = run_dir / "manifest.json"
     assert manifest_p.is_file()
+
+
+def _create_valid_qa_model(directory):
+    """Create a valid synthetic ONNX model for mocked integration tests."""
+
+    import numpy as np
+    import onnx
+
+    from onnx import helper, TensorProto, numpy_helper
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    model_path = directory / "qa_test_model.onnx"
+
+    model_input = helper.make_tensor_value_info(
+        "input",
+        TensorProto.FLOAT,
+        [1, 5, "height", "width"],
+    )
+
+    model_output = helper.make_tensor_value_info(
+        "output",
+        TensorProto.FLOAT,
+        [1, 4, "height", "width"],
+    )
+
+    weights = numpy_helper.from_array(
+        np.zeros((4, 5, 1, 1), dtype=np.float32),
+        name="weights",
+    )
+
+    bias = numpy_helper.from_array(
+        np.array([0, 0, 0, 10], dtype=np.float32),
+        name="bias",
+    )
+
+    convolution = helper.make_node(
+        "Conv",
+        ["input", "weights", "bias"],
+        ["output"],
+        kernel_shape=[1, 1],
+    )
+
+    graph = helper.make_graph(
+        [convolution],
+        "synthetic_qa_test_model",
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13)
+        ],
+        producer_name="integration-test-fixture",
+    )
+
+    model.ir_version = 8
+
+    onnx.checker.check_model(model)
+
+    onnx.save(model, str(model_path))
+
+    return model_path

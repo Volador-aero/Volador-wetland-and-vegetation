@@ -151,7 +151,7 @@ def test_pipeline_successful_run():
             t1_date="2026-08-01",
             t2_date="2026-08-15",
             config_path=config_path,
-            model_path=t1_dir / "scene_G.tif",  # dummy model path
+            model_path=_create_valid_qa_model(tmp_path),  # dummy model path
             output_base_dir=output_dir,
             run_id="run_pipeline_test"
         )
@@ -180,7 +180,93 @@ def test_pipeline_successful_run():
         # Verify manifest matches actual file structure
         with open(run_path / "manifest.json", "r") as f:
             manifest = json.load(f)
-            assert manifest["total_outputs"] == len(result.outputs) - 1
+            # Administrative records are intentionally excluded
+            # from the immutable output manifest.
+
+            from hashlib import sha256
+            from pathlib import Path as ManifestPath
+
+            excluded_outputs = {
+                "manifest.json",
+                "manifest_integrity.json",
+                "run_status.json",
+            }
+
+            registered_outputs = {
+                str(value).replace(chr(92), "/")
+                for value in result.outputs.values()
+            }
+
+            assert excluded_outputs.issubset(registered_outputs)
+
+            expected_outputs = registered_outputs - excluded_outputs
+
+            manifest_entries = manifest["outputs"]
+
+            assert isinstance(manifest_entries, list)
+
+            assert manifest["total_outputs"] == len(manifest_entries)
+
+            actual_outputs = {
+                entry["path"] for entry in manifest_entries
+            }
+
+            assert len(actual_outputs) == len(manifest_entries)
+
+            assert actual_outputs == expected_outputs
+
+            assert not actual_outputs.intersection(excluded_outputs)
+
+            run_directory = ManifestPath(result.output_directory)
+
+            for entry in manifest_entries:
+
+                output_path = run_directory / entry["path"]
+
+                assert output_path.is_file()
+
+                assert entry["status"] == "PASS"
+
+                assert entry["size_bytes"] == output_path.stat().st_size
+
+                digest = sha256()
+
+                with output_path.open("rb") as stream:
+                    for chunk in iter(
+                        lambda: stream.read(1024 * 1024),
+                        b"",
+                    ):
+                        digest.update(chunk)
+
+                assert entry["sha256"] == digest.hexdigest()
+
+            import json as manifest_json
+
+            integrity = manifest_json.loads(
+                (run_directory / "manifest_integrity.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            terminal = manifest_json.loads(
+                (run_directory / "run_status.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            assert integrity["status"] == "PASS"
+
+            assert integrity["integrity_verified"] is True
+
+            assert terminal["status"] == "COMPLETED"
+
+            assert terminal["execution_status"] == result.status
+
+            assert terminal["manifest_integrity_verified"] is True
+
+            assert terminal["manifest_sha256"] == sha256(
+                (run_directory / "manifest.json").read_bytes()
+            ).hexdigest()
 
 
 def test_pipeline_validation_errors():
@@ -226,3 +312,70 @@ def test_pipeline_validation_errors():
         )
         assert result2.status == "FAILED"
         assert any("directory not found" in err for err in result2.errors)
+
+
+def _create_valid_qa_model(directory):
+    """Create a valid synthetic ONNX model for mocked integration tests."""
+
+    import numpy as np
+    import onnx
+
+    from onnx import helper, TensorProto, numpy_helper
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    model_path = directory / "qa_test_model.onnx"
+
+    model_input = helper.make_tensor_value_info(
+        "input",
+        TensorProto.FLOAT,
+        [1, 5, "height", "width"],
+    )
+
+    model_output = helper.make_tensor_value_info(
+        "output",
+        TensorProto.FLOAT,
+        [1, 4, "height", "width"],
+    )
+
+    weights = numpy_helper.from_array(
+        np.zeros((4, 5, 1, 1), dtype=np.float32),
+        name="weights",
+    )
+
+    bias = numpy_helper.from_array(
+        np.array([0, 0, 0, 10], dtype=np.float32),
+        name="bias",
+    )
+
+    convolution = helper.make_node(
+        "Conv",
+        ["input", "weights", "bias"],
+        ["output"],
+        kernel_shape=[1, 1],
+    )
+
+    graph = helper.make_graph(
+        [convolution],
+        "synthetic_qa_test_model",
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13)
+        ],
+        producer_name="integration-test-fixture",
+    )
+
+    model.ir_version = 8
+
+    onnx.checker.check_model(model)
+
+    onnx.save(model, str(model_path))
+
+    return model_path

@@ -99,9 +99,13 @@ export default function DatasetMapPreview({
   const [drawing, setDrawing] =
     useState(false);
 
-  const [status, setStatus] = useState(
-    "Upload a T1 or T2 raster to preview it."
-  );
+  const [status, setStatus] = useState("");
+
+  const [rasterState, setRasterState] = useState<{
+    file: File;
+    date: "t1" | "t2";
+    state: "ready" | "error";
+  } | null>(null);
 
   /*
    * Exclusion currently being drawn and waiting
@@ -123,6 +127,39 @@ export default function DatasetMapPreview({
     selectedDate === "t1"
       ? t1File
       : t2File;
+
+  const [previousSelection, setPreviousSelection] = useState({
+    file: selectedFile,
+    date: selectedDate,
+  });
+
+  if (
+    previousSelection.file !== selectedFile ||
+    previousSelection.date !== selectedDate
+  ) {
+    setPreviousSelection({
+      file: selectedFile,
+      date: selectedDate,
+    });
+
+    setStatus("");
+    setRasterState(null);
+  }
+
+  const currentRasterState =
+    rasterState?.file === selectedFile &&
+    rasterState.date === selectedDate
+      ? rasterState.state
+      : null;
+
+  const displayStatus = !selectedFile
+    ? "Upload a T1 or T2 raster to preview it."
+    : currentRasterState === "error"
+      ? `Unable to render ${selectedDate.toUpperCase()} raster.`
+      : currentRasterState !== "ready"
+        ? `Loading ${selectedDate.toUpperCase()} raster...`
+        : status || `${selectedDate.toUpperCase()} raster tile loaded`;
+
 
   /*
    * ------------------------------------------------------------
@@ -236,9 +273,6 @@ export default function DatasetMapPreview({
     }
 
     if (!selectedFile) {
-      setStatus(
-        "Upload a T1 or T2 raster to preview it."
-      );
       return;
     }
 
@@ -248,9 +282,7 @@ export default function DatasetMapPreview({
     objectUrlRef.current =
       objectUrl;
 
-    setStatus(
-      `Loading ${selectedDate.toUpperCase()} raster...`
-    );
+
 
     const source = new GeoTIFF({
       sources: [
@@ -324,43 +356,55 @@ export default function DatasetMapPreview({
         );
     }
 
-    const handleSourceError =
-      () => {
-        setStatus(
-          `Unable to render ${selectedDate.toUpperCase()} raster.`
-        );
-      };
+    let cancelled = false;
+    let failed = false;
 
-    source.on(
-      "error",
-      handleSourceError
-    );
+    const isCurrentRaster = () =>
+      !cancelled &&
+      rasterLayerRef.current === rasterLayer;
 
-    const readyTimer =
-      window.setTimeout(() => {
-        if (
-          mapInstanceRef.current &&
-          rasterLayerRef.current ===
-            rasterLayer
-        ) {
-          setStatus(
-            `${selectedDate.toUpperCase()} raster loaded`
-          );
+    const handleSourceError = () => {
+      if (!isCurrentRaster()) return;
 
-          mapInstanceRef.current
-            .renderSync();
-        }
-      }, 500);
+      failed = true;
+
+      setRasterState({
+        file: selectedFile,
+        date: selectedDate,
+        state: "error",
+      });
+    };
+
+    const handleTileLoaded = () => {
+      if (!isCurrentRaster() || failed) return;
+
+      setRasterState({
+        file: selectedFile,
+        date: selectedDate,
+        state: "ready",
+      });
+    };
+
+    const handleSourceChange = () => {
+      if (!isCurrentRaster()) return;
+
+      if (source.getState() === "error") {
+        handleSourceError();
+      }
+    };
+
+    source.on("change", handleSourceChange);
+    source.on("tileloaderror", handleSourceError);
+    source.on("tileloadend", handleTileLoaded);
+
+    void source.getView().catch(handleSourceError);
 
     return () => {
-      window.clearTimeout(
-        readyTimer
-      );
+      cancelled = true;
 
-      source.un(
-        "error",
-        handleSourceError
-      );
+      source.un("change", handleSourceChange);
+      source.un("tileloaderror", handleSourceError);
+      source.un("tileloadend", handleTileLoaded);
 
       if (
         rasterLayerRef.current ===
@@ -1173,7 +1217,7 @@ export default function DatasetMapPreview({
         )}
 
         <div className="absolute bottom-4 left-4 right-4 z-30 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs text-[var(--text-secondary)] shadow-sm">
-          {status}
+          {displayStatus}
         </div>
       </div>
     </section>

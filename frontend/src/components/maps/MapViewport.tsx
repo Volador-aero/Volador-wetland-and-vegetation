@@ -16,6 +16,7 @@ export default function MapViewport() {
   const imageLayerRef = useRef<ImageLayer<ImageStatic> | null>(null);
 
   const {
+    project,
     runStatus,
     layers,
     activeLayerId,
@@ -55,28 +56,38 @@ export default function MapViewport() {
   useEffect(() => {
     const map = mapInstanceRef.current;
 
-    if (
-      !map ||
-      !runStatus?.run_id ||
-      !activeLayer ||
-      !activeLayer.ready
-    ) {
-      return;
-    }
+    if (!map) return;
 
-    // Remove existing image overlay
     if (imageLayerRef.current) {
       map.removeLayer(imageLayerRef.current);
       imageLayerRef.current = null;
     }
 
-    // Bounds in EPSG:4326
-    const rawBounds = activeLayer.bounds || [
-      13.3,
-      52.4,
-      13.5,
-      52.6,
-    ];
+    if (
+      !project?.id ||
+      !runStatus?.run_id ||
+      runStatus.project_id !== project.id ||
+      runStatus.status !== "COMPLETED" ||
+      !activeLayer?.ready ||
+      !activeLayer.bounds
+    ) {
+      return;
+    }
+
+    const rawBounds = activeLayer.bounds;
+
+    if (
+      rawBounds.length !== 4 ||
+      !rawBounds.every(Number.isFinite) ||
+      rawBounds[0] >= rawBounds[2] ||
+      rawBounds[1] >= rawBounds[3] ||
+      rawBounds[0] < -180 ||
+      rawBounds[2] > 180 ||
+      rawBounds[1] < -90 ||
+      rawBounds[3] > 90
+    ) {
+      return;
+    }
 
     const imageExtent = transformExtent(
       rawBounds,
@@ -86,7 +97,8 @@ export default function MapViewport() {
 
     const imgUrl = getLayerImageUrl(
       runStatus.run_id,
-      activeLayer.id
+      activeLayer.id,
+      project.id
     );
 
     const imageSource = new ImageStatic({
@@ -109,6 +121,9 @@ export default function MapViewport() {
       duration: 500,
     });
   }, [
+    project?.id,
+    runStatus?.project_id,
+    runStatus?.status,
     runStatus?.run_id,
     activeLayerId,
     activeLayer,

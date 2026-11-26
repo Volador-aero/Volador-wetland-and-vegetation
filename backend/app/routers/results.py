@@ -13,10 +13,16 @@ router = APIRouter(prefix="/api/runs/{run_id}/results", tags=["Results"])
 
 
 @router.get("")
-def get_run_results(run_id: str):
-    run_info = RunWorker.get_run_status(run_id)
+def get_run_results(run_id: str, project_id: str | None = None):
+    run_info = RunWorker.get_run_status(run_id, project_id=project_id)
     if not run_info:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    if run_info.get("status") != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail="Run outputs are not available for an incomplete or failed execution.",
+        )
 
     out_dir = Path(run_info["output_directory"])
     analysis_file = out_dir / "analysis_result.json"

@@ -52,7 +52,7 @@ export default function AnalysisPage({
       | "inputQaEnabled"
       | "temporalQaEnabled"
       | "changeQaEnabled",
-    value?: any
+    value?: unknown
   ) => {
     if (key === "analysisMode") {
       const targetMode: AnalysisMode =

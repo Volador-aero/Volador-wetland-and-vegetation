@@ -63,6 +63,7 @@ def test_project_crud_flow():
     assert status_data["run_id"] == run_id
 
     # 6. Delete project
+    _wait_for_project_workers(project_id)
     res = client.delete(f"/api/projects/{project_id}")
     assert res.status_code == 204
 
@@ -122,5 +123,35 @@ def test_real_tiff_upload_and_validation():
         assert run_res.json()["run_id"] is not None
 
     finally:
+        _wait_for_project_workers(proj_id)
         client.delete(f"/api/projects/{proj_id}")
 
+
+
+def _wait_for_project_workers(project_id, timeout=300):
+    """Wait for project workers before removing test data."""
+    from concurrent.futures import wait
+    from app import services
+
+    with services._PROJECT_LIFECYCLE_LOCK:
+        futures = [
+            future
+            for run_id, future in services._RUN_FUTURES.items()
+            if services.RUN_STATES.get(
+                run_id, {}
+            ).get("project_id") == project_id
+        ]
+
+    if futures:
+        completed, pending = wait(
+            futures, timeout=timeout
+        )
+
+        assert not pending, (
+            f"Project {project_id} still has active workers."
+        )
+
+        for future in completed:
+            future.result()
+
+    services._assert_project_idle(project_id)

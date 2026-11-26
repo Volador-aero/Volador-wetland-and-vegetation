@@ -109,6 +109,7 @@ def clean_project():
     yield proj_id
 
     # Cleanup
+    _wait_for_project_workers(proj_id)
     client.delete(f"/api/projects/{proj_id}")
 
 
@@ -407,3 +408,32 @@ def test_16_switching_vegetation_to_wetland_restores_t2_requirement(clean_projec
     assert val_wetland["valid"] is False
     assert val_wetland["status"] == "ERROR"
     assert any("t2 missing bands" in m.lower() for m in val_wetland["messages"])
+
+
+def _wait_for_project_workers(project_id, timeout=300):
+    """Wait for project workers before removing test data."""
+    from concurrent.futures import wait
+    from app import services
+
+    with services._PROJECT_LIFECYCLE_LOCK:
+        futures = [
+            future
+            for run_id, future in services._RUN_FUTURES.items()
+            if services.RUN_STATES.get(
+                run_id, {}
+            ).get("project_id") == project_id
+        ]
+
+    if futures:
+        completed, pending = wait(
+            futures, timeout=timeout
+        )
+
+        assert not pending, (
+            f"Project {project_id} still has active workers."
+        )
+
+        for future in completed:
+            future.result()
+
+    services._assert_project_idle(project_id)

@@ -1,25 +1,53 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import Sidebar from "./Sidebar";
 import TopBar from "./TopBar";
 import MapViewport from "../maps/MapViewport";
 import MetricCard from "../results/MetricCard";
 import ValidationStatus from "../datasets/ValidationStatus";
-import AnalysisPage from "../../features/analysis/AnalysisPage";
-import ResultsPage from "../../features/results/ResultsPage";
-import ValidationPage from "../../features/validation/ValidationPage";
-import ReportPage from "../../features/report/ReportPage";
-import PrepareAreaPage from "../../features/preparation/PrepareAreaPage";
 import { useProject } from "../../context/useProject";
 import type { DatasetValidationState } from "@/types/dataset";
 import { updateProjectDates } from "../../api/client";
 
+const AnalysisPage = lazy(() => import("../../features/analysis/AnalysisPage"));
+const ResultsPage = lazy(() => import("../../features/results/ResultsPage"));
+const ValidationPage = lazy(() => import("../../features/validation/ValidationPage"));
+const ReportPage = lazy(() => import("../../features/report/ReportPage"));
+const PrepareAreaPage = lazy(() => import("../../features/preparation/PrepareAreaPage"));
+
+function PageLoadingFallback() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex min-h-48 items-center justify-center text-sm text-[var(--text-secondary)]"
+    >
+      Loading page...
+    </div>
+  );
+}
+
 type AnalysisMode = "vegetation" | "wetland";
+
+type OverviewResultFields = {
+  vegetation?: {
+    classes?: Record<string, {
+      percentage?: number;
+    }>;
+  };
+  uncertainty?: {
+    mean_confidence?: number;
+  };
+};
+
 
 export default function AppShell() {
   const [activeItem, setActiveItem] = useState("Overview");
   // analysisMode is lifted here so both the Dataset page and the Analysis
   // page share the same mode without needing an extra context value.
-  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("wetland");
+  const [modeSelection, setModeSelection] = useState<{
+    projectId: string | undefined;
+    mode: AnalysisMode;
+  } | null>(null);
 
   const {
     project,
@@ -32,44 +60,62 @@ export default function AppShell() {
     error,
   } = useProject();
 
+  const projectId = project?.id;
+
+  const projectMode: AnalysisMode =
+    project?.analysis_mode === "vegetation"
+      ? "vegetation"
+      : "wetland";
+
+  const analysisMode: AnalysisMode =
+    modeSelection && modeSelection.projectId === projectId
+      ? modeSelection.mode
+      : projectMode;
+
+
   const [showDateModal, setShowDateModal] = useState(false);
   const [t1DateInput, setT1DateInput] = useState("");
   const [t2DateInput, setT2DateInput] = useState("");
   const [savingDates, setSavingDates] = useState(false);
   const [dateSaveError, setDateSaveError] = useState<string | null>(null);
 
-  useEffect(() => {
-    // Only prompt for dates in wetland (temporal) mode
-    if (validation?.dates_required && analysisMode === "wetland") {
-      setT1DateInput(project?.t1_date ?? "");
-      setT2DateInput(project?.t2_date ?? "");
-      setDateSaveError(null);
-      setShowDateModal(true);
-    }
-  }, [validation?.dates_required, project?.t1_date, project?.t2_date, analysisMode]);
+  const datePromptKey = JSON.stringify([
+    projectId,
+    validation?.dates_required === true,
+    project?.t1_date ?? "",
+    project?.t2_date ?? "",
+    analysisMode,
+  ]);
 
-  useEffect(() => {
-    if (
-      project?.analysis_mode &&
-      (project.analysis_mode === "vegetation" || project.analysis_mode === "wetland") &&
-      project.analysis_mode !== analysisMode
-    ) {
-      setAnalysisMode(project.analysis_mode);
-    }
-  }, [project?.analysis_mode]);
+  const [previousDatePromptKey, setPreviousDatePromptKey] =
+    useState("");
+
+  if (previousDatePromptKey !== datePromptKey) {
+    setPreviousDatePromptKey(datePromptKey);
+
+    const needsDates =
+      Boolean(projectId) &&
+      validation?.dates_required === true &&
+      analysisMode === "wetland";
+
+    setShowDateModal(needsDates);
+    setT1DateInput(project?.t1_date ?? "");
+    setT2DateInput(project?.t2_date ?? "");
+    setDateSaveError(null);
+  }
 
   const handleModeChange = (newMode: AnalysisMode) => {
-    setAnalysisMode(newMode);
-    if (project?.id) {
-      triggerValidation(newMode);
-    }
+    setModeSelection({
+      projectId,
+      mode: newMode,
+    });
   };
 
   useEffect(() => {
-    if (project?.id) {
-      triggerValidation(analysisMode);
+    if (projectId) {
+      void triggerValidation(analysisMode);
     }
-  }, [analysisMode, project?.id]);
+  }, [analysisMode, projectId, triggerValidation]);
 
   const handleSaveDates = async () => {
     if (!project) return;
@@ -143,8 +189,8 @@ export default function AppShell() {
 
       // Vegetation-mode overview metrics derived from results
       const vegClasses =
-        (results as any)?.vegetation?.classes ||
-        (results as any)?.metrics?.class_distribution?.classes ||
+        (results as OverviewResultFields | null)?.vegetation?.classes ||
+        results?.metrics?.class_distribution?.classes ||
         {};
       const healthyPct =
         typeof vegClasses["3"]?.percentage === "number"
@@ -156,8 +202,8 @@ export default function AppShell() {
           ? `${(vegClasses["1"].percentage + vegClasses["2"].percentage).toFixed(1)}%`
           : "—";
       const vegConf =
-        typeof (results as any)?.uncertainty?.mean_confidence === "number"
-          ? `${((results as any).uncertainty.mean_confidence * 100).toFixed(1)}%`
+        typeof (results as OverviewResultFields | null)?.uncertainty?.mean_confidence === "number"
+          ? `${(((results as OverviewResultFields | null)?.uncertainty?.mean_confidence ?? 0) * 100).toFixed(1)}%`
           : "—";
 
       return (
@@ -172,12 +218,12 @@ export default function AppShell() {
                 </div>
 
                 <div className="mt-2 text-lg font-medium text-[var(--text)]">
-                  {validation?.valid ? "Dataset Loaded & Validated" : "Sentinel-2 Multispectral"}
+                  {validation?.valid ? "Dataset Loaded & Validated" : "Not available"}
                 </div>
 
                 <div className="mt-1 text-xs text-[var(--text-secondary)]">
-                  CRS: {validation?.metadata?.crs || "EPSG:32633"} · Resolution:{" "}
-                  {validation?.metadata?.resolution || "10.0m x 10.0m"} · Single-date vegetation health analysis
+                  CRS: {validation?.metadata?.crs || "Not available"} · Resolution:{" "}
+                  {validation?.metadata?.resolution || "Not available"} · Single-date vegetation health analysis
                 </div>
               </div>
             </section>
@@ -186,31 +232,31 @@ export default function AppShell() {
             <section className="grid grid-cols-2 gap-4">
               <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-5">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-                  T1 Baseline — {project?.t1_date || "2023-08-14"}
+                  T1 Baseline — {project?.t1_date || "Not available"}
                 </div>
 
                 <div className="mt-2 text-lg font-medium text-[var(--text)]">
-                  {validation?.valid ? "Dataset Loaded & Validated" : "Sentinel-2 Multispectral"}
+                  {validation?.valid ? "Dataset Loaded & Validated" : "Not available"}
                 </div>
 
                 <div className="mt-1 text-xs text-[var(--text-secondary)]">
-                  CRS: {validation?.metadata?.crs || "EPSG:32633"} · Resolution:{" "}
-                  {validation?.metadata?.resolution || "10.0m x 10.0m"}
+                  CRS: {validation?.metadata?.crs || "Not available"} · Resolution:{" "}
+                  {validation?.metadata?.resolution || "Not available"}
                 </div>
               </div>
 
               <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-5">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--text-secondary)]">
-                  T2 Comparison — {project?.t2_date || "2023-08-28"}
+                  T2 Comparison — {project?.t2_date || "Not available"}
                 </div>
 
                 <div className="mt-2 text-lg font-medium text-[var(--text)]">
-                  {validation?.valid ? "Dataset Loaded & Validated" : "Sentinel-2 Multispectral"}
+                  {validation?.valid ? "Dataset Loaded & Validated" : "Not available"}
                 </div>
 
                 <div className="mt-1 text-xs text-[var(--text-secondary)]">
-                  CRS: {validation?.metadata?.crs || "EPSG:32633"} · Resolution:{" "}
-                  {validation?.metadata?.resolution || "10.0m x 10.0m"}
+                  CRS: {validation?.metadata?.crs || "Not available"} · Resolution:{" "}
+                  {validation?.metadata?.resolution || "Not available"}
                 </div>
               </div>
             </section>
@@ -236,7 +282,7 @@ export default function AppShell() {
               <MetricCard
                 label="Quality Status"
                 value={
-                  (results as any)?.validation?.overall_status ||
+                  results?.validation?.overall_status ||
                   runStatus?.status ||
                   (validation?.valid ? "PASS" : "READY")
                 }
@@ -249,14 +295,7 @@ export default function AppShell() {
                 value={
                   typeof results?.wetland?.area_ha === "number" && results.wetland.area_ha > 0
                     ? `${results.wetland.area_ha.toFixed(2)} ha`
-                    : results?.spatial?.dimensions
-                    ? `${(
-                        (results.spatial.dimensions[0] *
-                          results.spatial.dimensions[1] *
-                          (results.spatial.resolution?.[0] || 10) *
-                          (results.spatial.resolution?.[1] || 10)) /
-                        10000
-                      ).toFixed(2)} ha`
+
                     : "—"
                 }
               />
@@ -564,15 +603,25 @@ export default function AppShell() {
 
     if (activeItem === "Analysis")
       return (
-        <AnalysisPage
+        <Suspense fallback={<PageLoadingFallback />}>
+<AnalysisPage
           analysisMode={analysisMode}
           onAnalysisModeChange={handleModeChange}
         />
+</Suspense>
       );
-    if (activeItem === "Prepare") return <PrepareAreaPage analysisMode={analysisMode} />;
-    if (activeItem === "Results") return <ResultsPage />;
-    if (activeItem === "Validation") return <ValidationPage />;
-    if (activeItem === "Report") return <ReportPage analysisMode={analysisMode} />;
+    if (activeItem === "Prepare") return <Suspense fallback={<PageLoadingFallback />}>
+<PrepareAreaPage analysisMode={analysisMode} />
+</Suspense>;
+    if (activeItem === "Results") return <Suspense fallback={<PageLoadingFallback />}>
+<ResultsPage />
+</Suspense>;
+    if (activeItem === "Validation") return <Suspense fallback={<PageLoadingFallback />}>
+<ValidationPage />
+</Suspense>;
+    if (activeItem === "Report") return <Suspense fallback={<PageLoadingFallback />}>
+<ReportPage analysisMode={analysisMode} />
+</Suspense>;
 
     return null;
   };

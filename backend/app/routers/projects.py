@@ -130,7 +130,7 @@ def update_project_preparation(project_id: str, payload: PreparationUpdateReques
 
     clean_exclusions = []
     for exc in payload.manual_exclusions:
-        exc_dict = exc.dict() if hasattr(exc, "dict") else exc
+        exc_dict = exc.model_dump() if hasattr(exc, "model_dump") else exc
         if not exc_dict.get("comment", "").strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

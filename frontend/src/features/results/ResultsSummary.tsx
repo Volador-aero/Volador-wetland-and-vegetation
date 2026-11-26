@@ -8,30 +8,36 @@ export default function ResultsSummary() {
   const rec = results?.recovery || {};
   const metrics = results?.metrics || {};
 
+  const analysisScope = metrics.analysis_scope;
+
+  const baseline = metrics.baseline_area;
+
   const totalAreaHa =
-    results?.wetland?.area_ha ??
-    metrics.area?.total_area_ha ??
-    metrics.analysis_extent?.valid_analysis_area_ha ??
-    results?.spatial?.total_area_ha;
-  const baselineHa = typeof totalAreaHa === "number" ? `${totalAreaHa.toFixed(2)} ha` : "—";
+    baseline &&
+    typeof baseline === "object" &&
+    "area_ha" in baseline
+      ? baseline.area_ha
+      : undefined;
+
+  const baselineHa = typeof totalAreaHa === "number" && Number.isFinite(totalAreaHa) ? `${totalAreaHa.toFixed(2)} ha` : "—";
 
   const degHa = deg.area_ha ?? metrics.degradation?.degraded_area_ha ?? metrics.impact_area?.degradation_ha;
-  const affectedHa = typeof degHa === "number" ? `${degHa.toFixed(2)} ha` : "—";
+  const affectedHa = typeof degHa === "number" && Number.isFinite(degHa) ? `${degHa.toFixed(2)} ha` : "—";
 
   const swdVal = metrics.severity_weighted_degradation_area_ha ?? metrics.degradation?.severity_weighted_degradation_ha;
-  const swdHa = typeof swdVal === "number" ? `${swdVal.toFixed(2)} ha_deg` : "—";
+  const swdHa = typeof swdVal === "number" && Number.isFinite(swdVal) ? `${swdVal.toFixed(2)} ha_deg` : "—";
 
   const ndrVal = metrics.normalized_degradation_ratio ?? metrics.degradation?.normalized_degradation_ratio;
-  const ratioPct = typeof ndrVal === "number" ? `${(ndrVal * 100).toFixed(1)}%` : "—";
+  const ratioPct = typeof ndrVal === "number" && Number.isFinite(ndrVal) ? `${(ndrVal * 100).toFixed(1)}%` : "—";
 
   const recHaVal = rec.area_ha ?? metrics.degradation?.recovered_area_ha ?? metrics.recovery_area?.recovery_ha;
-  const recoveryHa = typeof recHaVal === "number" ? `${recHaVal.toFixed(2)} ha` : "—";
+  const recoveryHa = typeof recHaVal === "number" && Number.isFinite(recHaVal) ? `${recHaVal.toFixed(2)} ha` : "—";
 
   return (
     <section>
       <div className="mb-3">
         <div className="text-sm font-medium text-[var(--text)]">
-          Real Scientific Area Summary
+          Analysis Area Summary
         </div>
 
         <div className="mt-1 text-xs text-[var(--text-secondary)]">
@@ -43,7 +49,13 @@ export default function ResultsSummary() {
         <MetricCard
           label="Baseline Area"
           value={baselineHa}
-          description="Wetland analysis area at T1."
+          description={
+            analysisScope === "GENERAL_VEGETATION"
+              ? "Valid general vegetation analysis area."
+              : analysisScope === "WETLAND_CONTEXT"
+                ? "Valid wetland-context analysis area."
+                : "Engine-reported baseline; scope not established."
+          }
         />
 
         <MetricCard

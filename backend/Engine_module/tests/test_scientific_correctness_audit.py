@@ -119,7 +119,7 @@ def test_1_identical_t1_t2(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -158,7 +158,7 @@ def test_2_identical_data_different_dates(mock_predict, mock_load, tmp_path):
         t1_date="2022-01-01",
         t2_date="2023-12-31",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -191,7 +191,7 @@ def test_3_near_identical_data(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -224,7 +224,7 @@ def test_4_no_meaningful_change(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -260,7 +260,7 @@ def test_5_controlled_degradation(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -297,7 +297,7 @@ def test_6_controlled_recovery(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -330,7 +330,7 @@ def test_7_stable_classes(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -384,7 +384,7 @@ def test_9_nodata_handling(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -482,7 +482,7 @@ def test_13_wetland_masking(mock_predict, mock_load, tmp_path):
     _create_raster_scene(t2_dir)
 
     geojson_path = tmp_path / "boundary.geojson"
-    geojson_data = {
+    geojson_data = {"crs": {"type": "name", "properties": {"name": "EPSG:32632"}},
         "type": "FeatureCollection",
         "features": [{
             "type": "Feature",
@@ -503,7 +503,7 @@ def test_13_wetland_masking(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
         wetland_boundary=geojson_path,
     )
@@ -536,7 +536,7 @@ def test_14_metric_reconciliation(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -577,7 +577,7 @@ def test_15_deterministic_repeatability(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=tmp_path / "out1",
         run_id="run1",
     )
@@ -593,7 +593,7 @@ def test_15_deterministic_repeatability(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=tmp_path / "out2",
         run_id="run2",
     )
@@ -627,7 +627,7 @@ def test_16_report_data_consistency(mock_predict, mock_load, tmp_path):
         t1_date="2023-08-14",
         t2_date="2023-08-28",
         config_path=CONFIG_PATH,
-        model_path=t1_dir / "green.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_dir=out_dir,
     )
 
@@ -637,3 +637,70 @@ def test_16_report_data_consistency(mock_predict, mock_load, tmp_path):
 
     report_text = md_report.read_text(encoding="utf-8")
     assert "0.00 ha" in report_text or "0.0 ha" in report_text or "0.0" in report_text
+
+
+def _create_valid_qa_model(directory):
+    """Create a valid synthetic ONNX model for mocked integration tests."""
+
+    import numpy as np
+    import onnx
+
+    from onnx import helper, TensorProto, numpy_helper
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    model_path = directory / "qa_test_model.onnx"
+
+    model_input = helper.make_tensor_value_info(
+        "input",
+        TensorProto.FLOAT,
+        [1, 5, "height", "width"],
+    )
+
+    model_output = helper.make_tensor_value_info(
+        "output",
+        TensorProto.FLOAT,
+        [1, 4, "height", "width"],
+    )
+
+    weights = numpy_helper.from_array(
+        np.zeros((4, 5, 1, 1), dtype=np.float32),
+        name="weights",
+    )
+
+    bias = numpy_helper.from_array(
+        np.array([0, 0, 0, 10], dtype=np.float32),
+        name="bias",
+    )
+
+    convolution = helper.make_node(
+        "Conv",
+        ["input", "weights", "bias"],
+        ["output"],
+        kernel_shape=[1, 1],
+    )
+
+    graph = helper.make_graph(
+        [convolution],
+        "synthetic_qa_test_model",
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13)
+        ],
+        producer_name="integration-test-fixture",
+    )
+
+    model.ir_version = 8
+
+    onnx.checker.check_model(model)
+
+    onnx.save(model, str(model_path))
+
+    return model_path

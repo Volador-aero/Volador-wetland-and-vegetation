@@ -2,7 +2,7 @@ import "@testing-library/jest-dom";
 import { vi } from "vitest";
 
 // Mock canvas getContext
-HTMLCanvasElement.prototype.getContext = vi.fn() as any;
+HTMLCanvasElement.prototype.getContext = vi.fn(() => null) as typeof HTMLCanvasElement.prototype.getContext;
 
 // Mock URL.createObjectURL and revokeObjectURL
 if (typeof window !== "undefined") {
@@ -15,4 +15,4 @@ globalThis.ResizeObserver = class {
   observe() {}
   unobserve() {}
   disconnect() {}
-} as any;
+};

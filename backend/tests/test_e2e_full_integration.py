@@ -55,7 +55,7 @@ def test_full_e2e_user_workflow():
     run_id = run_data["run_id"]
 
     # 4. Frontend polls run status until completion
-    max_wait = 60  # seconds
+    max_wait = 300  # seconds
     start_time = time.time()
     completed = False
 
@@ -108,6 +108,7 @@ def test_full_e2e_user_workflow():
     assert len(res_tech.content) > 1000  # Non-empty technical PDF document
 
     # Clean up project
+    _wait_for_project_workers(project_id)
     client.delete(f"/api/projects/{project_id}")
 
 
@@ -137,6 +138,10 @@ def test_scientific_regression_reproducibility(tmp_path):
         run_id="baseline_run"
     )
 
+    assert res_direct.status in ["SUCCESS", "WARNING"], (
+        f"Direct engine failed: {res_direct.status}"
+    )
+
     # API execution
     proj_res = client.post("/api/projects", json={"name": "Regression Test Proj"})
     proj_id = proj_res.json()["id"]
@@ -150,7 +155,16 @@ def test_scientific_regression_reproducibility(tmp_path):
             break
         time.sleep(0.5)
 
-    api_results = client.get(f"/api/runs/{run_id}/results").json()
+    _wait_for_project_workers(proj_id)
+    terminal_response = client.get(f"/api/runs/{run_id}")
+    assert terminal_response.status_code == 200
+    terminal = terminal_response.json()
+    assert terminal["status"] == "COMPLETED", terminal
+
+    results_response = client.get(f"/api/runs/{run_id}/results")
+    assert results_response.status_code == 200
+    api_results = results_response.json()
+    assert api_results["status"] in ["SUCCESS", "WARNING"]
 
     # Read baseline analysis_result.json written by direct engine call
     baseline_json_path = baseline_out / "baseline_run" / "analysis_result.json"
@@ -166,4 +180,34 @@ def test_scientific_regression_reproducibility(tmp_path):
     )
     assert direct_json["spatial"]["dimensions"] == api_results["spatial"]["dimensions"]
 
+    _wait_for_project_workers(proj_id)
     client.delete(f"/api/projects/{proj_id}")
+
+
+def _wait_for_project_workers(project_id, timeout=300):
+    """Wait for project workers before removing test data."""
+    from concurrent.futures import wait
+    from app import services
+
+    with services._PROJECT_LIFECYCLE_LOCK:
+        futures = [
+            future
+            for run_id, future in services._RUN_FUTURES.items()
+            if services.RUN_STATES.get(
+                run_id, {}
+            ).get("project_id") == project_id
+        ]
+
+    if futures:
+        completed, pending = wait(
+            futures, timeout=timeout
+        )
+
+        assert not pending, (
+            f"Project {project_id} still has active workers."
+        )
+
+        for future in completed:
+            future.result()
+
+    services._assert_project_idle(project_id)

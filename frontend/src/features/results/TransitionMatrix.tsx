@@ -6,8 +6,11 @@ export default function TransitionMatrix() {
   const { results } = useProject();
 
   const transitionData =
-    results?.metrics?.transition_matrix || (results as any)?.transition_matrix;
-  const matrixValues = transitionData?.matrix_m2 || transitionData?.matrix_pixels;
+    results?.metrics?.transition_matrix || results?.transition_matrix;
+  const hasPhysicalArea = Array.isArray(transitionData?.matrix_m2);
+  const matrixValues = hasPhysicalArea
+    ? transitionData?.matrix_m2
+    : transitionData?.matrix_pixels;
 
   return (
     <section className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-5">
@@ -17,7 +20,7 @@ export default function TransitionMatrix() {
         </div>
 
         <div className="mt-1 text-xs text-[var(--text-secondary)]">
-          T1 (Baseline) class → T2 (Comparison) class transition area in hectares (ha).
+          T1 (Baseline) class → T2 (Comparison) class transitions in {hasPhysicalArea ? "hectares (ha)" : "pixels"}.
         </div>
       </div>
 
@@ -51,8 +54,10 @@ export default function TransitionMatrix() {
                   let valStr = "—";
                   if (matrixValues && Array.isArray(matrixValues)) {
                     const rawVal = matrixValues[rowIndex]?.[colIndex];
-                    if (rawVal !== undefined && rawVal !== null) {
-                      valStr = (rawVal / 10000.0).toFixed(2) + " ha";
+                    if (typeof rawVal === "number" && Number.isFinite(rawVal) && rawVal >= 0) {
+                      valStr = hasPhysicalArea
+                        ? (rawVal / 10000.0).toFixed(2) + " ha"
+                        : rawVal.toLocaleString() + " px";
                     }
                   }
                   return (
@@ -75,7 +80,7 @@ export default function TransitionMatrix() {
       </div>
 
       <div className="mt-4 text-[11px] text-[var(--text-secondary)]">
-        Diagonal cells indicate stable area; off-diagonal cells represent vegetation health transitions.
+        Diagonal cells indicate unchanged classes; off-diagonal cells represent vegetation health transitions.
       </div>
     </section>
   );

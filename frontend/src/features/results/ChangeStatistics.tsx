@@ -9,8 +9,8 @@ export default function ChangeStatistics() {
   const cats = results?.change?.category_summary || {};
   const wetland = results?.wetland || {};
 
-  const fmtNum = (val?: any) => (typeof val === "number" ? val.toFixed(4) : "—");
-  const fmtHa = (val?: any) => (typeof val === "number" ? `${val.toFixed(2)} ha` : "—");
+  const fmtNum = (val?: unknown) => (typeof val === "number" && Number.isFinite(val) ? val.toFixed(4) : "—");
+  const fmtHa = (val?: unknown) => (typeof val === "number" && Number.isFinite(val) ? `${val.toFixed(2)} ha` : "—");
 
   const canopyLossHa = cats["VEGETATION_TO_BACKGROUND"]?.area_ha;
 
@@ -34,7 +34,13 @@ export default function ChangeStatistics() {
     ["Recovery", fmtHa(rec.area_ha)],
     ["Canopy loss", fmtHa(canopyLossHa)],
     ["Physical Depletion Status", results?.physical_depletion_assessment || "NOT_ASSESSED"],
-    ["Wetland Extent Area", fmtHa(wetland.area_ha)],
+    [
+      "Wetland Context Area",
+      results?.metrics?.analysis_scope === "WETLAND_CONTEXT" &&
+      results?.metrics?.wetland_context_available === true
+        ? fmtHa(wetland.area_ha)
+        : "NOT_AVAILABLE",
+    ],
   ];
 
   return (

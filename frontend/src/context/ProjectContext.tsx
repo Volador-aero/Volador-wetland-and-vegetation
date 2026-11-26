@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import type {
   Project,
   ValidationResult,
@@ -38,6 +38,7 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
   children,
 }) => {
   const [project, setProject] = useState<Project | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [runStatus, setRunStatus] = useState<RunStatus | null>(null);
   const [results, setResults] = useState<AnalysisResults | null>(null);
@@ -50,156 +51,394 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
   );
   const [preparation, setPreparation] = useState<PreparationState | null>(null);
 
-  // Stable function: load run results and layers.
-  // activeLayerId is intentionally excluded from deps to avoid a load loop.
-  const loadRunData = useCallback(async (runId: string) => {
-    try {
-      const resData = await getRunResults(runId);
-      setResults(resData);
+  const projectSessionRef = useRef(0);
+  const activeProjectIdRef = useRef<string | null>(null);
+  const validationRequestRef = useRef(0);
+  const resultRequestRef = useRef(0);
+  const runLaunchesRef = useRef(new Set<string>());
+  const initializationRef = useRef<Promise<Project[]> | null>(null);
+  const creationPendingRef = useRef(false);
+  const resettingProjectsRef = useRef(new Set<string>());
+  const preparationRequestRef = useRef(0);
+  const preparationMutationRef = useRef<number | null>(null);
 
-      const layerList = await getRunLayers(runId);
-      setLayers(layerList);
-
-      setActiveLayerId((prev) => {
-        if (layerList.length > 0 && !prev) {
-          return layerList[0].id;
-        }
-        return prev;
-      });
-    } catch (err: unknown) {
-      console.error("Failed to load run outputs:", err);
-    }
+  const activateProjectSession = useCallback((projectId: string) => {
+    projectSessionRef.current += 1;
+    validationRequestRef.current += 1;
+    resultRequestRef.current += 1;
+    preparationRequestRef.current += 1;
+    preparationMutationRef.current = null;
+    activeProjectIdRef.current = projectId;
   }, []);
 
-  // Initialize or fetch default project on load.
+  const isCurrentSession = useCallback((
+    projectId: string,
+    session: number
+  ) => {
+    return (
+      activeProjectIdRef.current === projectId &&
+      projectSessionRef.current === session
+    );
+  }, []);
+
+
+  // Load outputs only for the active project session.
+  const loadRunData = useCallback(async (
+    runId: string,
+    expectedProjectId?: string,
+    expectedSession?: number
+  ) => {
+    const projectId =
+      expectedProjectId ?? activeProjectIdRef.current;
+
+    const session =
+      expectedSession ?? projectSessionRef.current;
+
+    if (!projectId || !isCurrentSession(projectId, session)) {
+      return;
+    }
+
+    const request = ++resultRequestRef.current;
+
+    const isCurrentRequest = () =>
+      isCurrentSession(projectId, session) &&
+      resultRequestRef.current === request;
+
+    try {
+      const layerRequest = getRunLayers(runId, projectId)
+        .then((value) => ({ ok: true as const, value }))
+        .catch((reason: unknown) => ({
+          ok: false as const,
+          reason,
+        }));
+
+      const resData = await getRunResults(runId, projectId);
+
+      if (!isCurrentRequest()) return;
+
+      if (resData.run_id !== runId) {
+        throw new Error("Unexpected analysis result identity.");
+      }
+
+      setResults(resData);
+
+      const layerResponse = await layerRequest;
+
+      if (!isCurrentRequest()) return;
+
+      if (!layerResponse.ok) {
+        setLayers([]);
+        setActiveLayerId("");
+        setError("Analysis results loaded, but map layers are unavailable.");
+        return;
+      }
+
+      const layerList = layerResponse.value;
+      setLayers(layerList);
+
+      setActiveLayerId((prev) =>
+        layerList.some((layer) => layer.id === prev)
+          ? prev
+          : layerList[0]?.id ?? ""
+      );
+    } catch (err: unknown) {
+      if (!isCurrentRequest()) return;
+
+      console.error("Failed to load run outputs:", err);
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Failed to load run outputs."
+      );
+    }
+  }, [isCurrentSession]);
+
+  // Share initialization across StrictMode effect replays.
   useEffect(() => {
-    async function init() {
+    let cancelled = false;
+
+    const initialSession = projectSessionRef.current;
+
+    const initializeProjects = async (): Promise<Project[]> => {
+      const existing = await getProjects();
+
+      if (existing.length > 0) {
+        return existing;
+      }
+
+      const created = await createProject(
+        "Wetland Degradation Study",
+        "Sentinel-2 5-channel temporal degradation analysis",
+        "Central Reserve"
+      );
+
+      return [created];
+    };
+
+    const init = async () => {
+      let activeSession = initialSession;
+
+      const isActive = () =>
+        !cancelled &&
+        projectSessionRef.current === activeSession;
+
       try {
         setLoading(true);
         setError(null);
 
-        const existing = await getProjects();
-
-        let currentProj: Project;
-
-        if (existing.length > 0) {
-          currentProj = existing[0];
-        } else {
-          currentProj = await createProject(
-            "Wetland Degradation Study",
-            "Sentinel-2 5-channel temporal degradation analysis"
-          );
+        if (!initializationRef.current) {
+          initializationRef.current = initializeProjects();
         }
+
+        const existing = await initializationRef.current;
+
+        if (!isActive()) return;
+
+        const currentProj = existing[0];
+
+        if (!currentProj) {
+          throw new Error("No project available.");
+        }
+
+        setProjects(existing);
+
+        activateProjectSession(currentProj.id);
+
+        activeSession = projectSessionRef.current;
 
         setProject(currentProj);
 
-        // Restore an existing run only if it still exists.
-        if (currentProj.latest_run_id) {
-          try {
-            const existingRun = await getRunStatus(currentProj.latest_run_id);
+        const preparationRequest =
+          ++preparationRequestRef.current;
 
-            setRunStatus(existingRun);
+        try {
+          const state = await getPreparation(currentProj.id);
 
-            if (existingRun.status === "COMPLETED") {
-              await loadRunData(existingRun.run_id);
-            }
-          } catch (err) {
+          if (!isActive()) return;
+
+          if (
+            preparationRequestRef.current === preparationRequest
+          ) {
+            setPreparation(state);
+          }
+        } catch (err) {
+          if (isActive()) {
             console.warn(
-              `Ignoring stale latest_run_id ${currentProj.latest_run_id}:`,
+              "Could not restore project preparation:",
               err
             );
           }
         }
 
-        // Fetch current dataset validation status.
-        try {
-          const initialMode = (currentProj.analysis_mode as "vegetation" | "wetland") ?? "wetland";
-          const val = await validateDatasets(currentProj.id, initialMode);
-          setValidation(val);
-          if (val.valid && (!currentProj.datasets_ready || currentProj.status === "INVALID")) {
-            setProject((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    datasets_ready: true,
-                    status:
-                      prev.preparation_status === "COMMITTED"
-                        ? "PREPARATION_COMMITTED"
-                        : "DATASETS_CONFIGURED",
-                  }
-                : null
+        if (!isActive()) return;
+
+        if (currentProj.latest_run_id) {
+          try {
+            const existingRun = await getRunStatus(
+              currentProj.latest_run_id,
+              currentProj.id
             );
+
+            if (!isActive()) return;
+
+            if (
+              existingRun.run_id !== currentProj.latest_run_id ||
+              existingRun.project_id !== currentProj.id
+            ) {
+              throw new Error("Unexpected restored run identity.");
+            }
+
+            setRunStatus(existingRun);
+
+            if (existingRun.status === "COMPLETED") {
+              await loadRunData(
+                existingRun.run_id,
+                currentProj.id,
+                activeSession
+              );
+            }
+          } catch (err) {
+            if (isActive()) {
+              console.warn(
+                "Could not restore the latest run:",
+                err
+              );
+            }
           }
-        } catch {
-          // Non-blocking initial validation check.
         }
+
+        // AppShell triggers validation for the active project.
+        // Avoid issuing a competing initialization request.
+
       } catch (err: unknown) {
-        const message =
-          err instanceof Error ? err.message : "Unknown error";
+        if (isActive()) {
+          const message =
+            err instanceof Error
+              ? err.message
+              : "Unknown error";
 
-        console.error("Failed to connect to backend API:", message);
-        setError(`Backend connection error: ${message}`);
+          setError(`Backend connection error: ${message}`);
+        }
       } finally {
-        setLoading(false);
+        if (isActive()) {
+          setLoading(false);
+        }
       }
-    }
+    };
 
-    init();
-  }, [loadRunData]);
+    void init();
 
-  // Poll run status when active run is running.
+    return () => {
+      cancelled = true;
+    };
+  }, [loadRunData, activateProjectSession]);
+
+  const pollingRunId = runStatus?.run_id;
+  const pollingStatus = runStatus?.status;
+  const pollingProjectId = project?.id;
+
+  // Schedule the next poll only after the current request finishes.
   useEffect(() => {
-    if (!runStatus || ["COMPLETED", "FAILED"].includes(runStatus.status)) {
+    if (
+      !pollingRunId ||
+      !pollingProjectId ||
+      !pollingStatus ||
+      ["COMPLETED", "FAILED"].includes(pollingStatus)
+    ) {
       return;
     }
 
-    const interval = setInterval(async () => {
+    const session = projectSessionRef.current;
+
+    let cancelled = false;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const isActive = () =>
+      !cancelled &&
+      isCurrentSession(pollingProjectId, session);
+
+    const poll = async () => {
+      if (!isActive()) return;
+
+      let terminal = false;
+
       try {
-        const updated = await getRunStatus(runStatus.run_id);
+        const updated = await getRunStatus(pollingRunId, pollingProjectId);
+
+        if (!isActive()) return;
+
+        if (updated.run_id !== pollingRunId || updated.project_id !== pollingProjectId) {
+          throw new Error("Unexpected run identity.");
+        }
 
         setRunStatus(updated);
 
+        terminal = ["COMPLETED", "FAILED"].includes(
+          updated.status
+        );
+
         if (updated.status === "COMPLETED") {
-          loadRunData(updated.run_id);
+          await loadRunData(
+            pollingRunId,
+            pollingProjectId,
+            session
+          );
         }
       } catch (err) {
-        console.error("Status poll error:", err);
+        if (isActive()) {
+          console.error("Status poll error:", err);
+        }
+      } finally {
+        if (isActive() && !terminal) {
+          timer = setTimeout(poll, 1000);
+        }
       }
-    }, 1000);
+    };
 
-    return () => clearInterval(interval);
-  }, [runStatus, loadRunData]);
+    timer = setTimeout(poll, 1000);
 
-  const triggerValidation = async (mode?: "vegetation" | "wetland") => {
-    if (!project) return;
+    return () => {
+      cancelled = true;
+
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    };
+  }, [
+    pollingRunId,
+    pollingStatus,
+    pollingProjectId,
+    loadRunData,
+    isCurrentSession,
+  ]);
+
+  const validationProjectId = project?.id;
+  const validationProjectMode = project?.analysis_mode;
+
+  const triggerValidation = useCallback(async (
+    mode?: "vegetation" | "wetland"
+  ) => {
+    if (
+      !validationProjectId ||
+      activeProjectIdRef.current !== validationProjectId
+    ) return;
+
+    const session = projectSessionRef.current;
+    const request = ++validationRequestRef.current;
+
+    const isCurrentRequest = () =>
+      isCurrentSession(validationProjectId, session) &&
+      validationRequestRef.current === request;
 
     try {
       setLoading(true);
       setError(null);
 
-      const resolvedMode = mode ?? (project.analysis_mode as "vegetation" | "wetland") ?? "wetland";
-      const val = await validateDatasets(project.id, resolvedMode);
+      const resolvedMode =
+        mode ??
+        (validationProjectMode === "vegetation"
+          ? "vegetation"
+          : "wetland");
+
+      const val = await validateDatasets(
+        validationProjectId,
+        resolvedMode
+      );
+
+      if (!isCurrentRequest()) return;
 
       setValidation(val);
 
       setProject((prev) =>
-        prev
+        prev?.id === validationProjectId
           ? {
               ...prev,
               analysis_mode: resolvedMode,
               datasets_ready: val.valid,
               status: val.valid ? "READY" : "INVALID",
             }
-          : null
+          : prev
       );
     } catch (err: unknown) {
+      if (!isCurrentRequest()) return;
+
       setError(
-        err instanceof Error ? err.message : "Validation failed"
+        err instanceof Error
+          ? err.message
+          : "Validation failed"
       );
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+      }
     }
-  };
+  }, [
+    validationProjectId,
+    validationProjectMode,
+    isCurrentSession,
+  ]);
 
   const uploadBand = async (
     timePoint: "t1" | "t2",
@@ -209,16 +448,35 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
   ) => {
     if (!project) return;
 
+    const pid = project.id;
+    const session = projectSessionRef.current;
+
+    const isCurrent = () =>
+      isCurrentSession(pid, session);
+
+    if (!isCurrent()) return;
+
     try {
       setLoading(true);
       setError(null);
 
-      await uploadBandFile(project.id, timePoint, band, file);
+      await uploadBandFile(pid, timePoint, band, file);
+
+      if (!isCurrent()) return;
+
       await triggerValidation(mode);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Upload failed");
+      if (isCurrent()) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Upload failed"
+        );
+      }
     } finally {
-      setLoading(false);
+      if (isCurrent()) {
+        setLoading(false);
+      }
     }
   };
 
@@ -256,74 +514,368 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
   // Preparation / staging workflow
   // ------------------------------------------------------------
 
+  const preparationProjectId = project?.id;
+
   const fetchPreparation = useCallback(
     async (projectId?: string): Promise<PreparationState | undefined> => {
-      const pid = projectId ?? project?.id;
-      if (!pid) return undefined;
+      const pid = projectId ?? preparationProjectId;
+
+      if (
+        !pid ||
+        activeProjectIdRef.current !== pid ||
+        preparationMutationRef.current !== null
+      ) {
+        return undefined;
+      }
+
+      const session = projectSessionRef.current;
+      const request = ++preparationRequestRef.current;
+
+      const isCurrent = () =>
+        isCurrentSession(pid, session) &&
+        preparationRequestRef.current === request;
+
       try {
         const state = await getPreparation(pid);
+
+        if (!isCurrent()) return undefined;
+
         setPreparation(state);
+
         return state;
       } catch (err) {
-        console.warn("fetchPreparation failed:", err);
+        if (isCurrent()) {
+          console.warn("fetchPreparation failed:", err);
+        }
+
         return undefined;
       }
     },
-    [project?.id]
+    [preparationProjectId, isCurrentSession]
   );
+
+  const mutatePreparation = useCallback(async (
+    projectId: string,
+    operation: () => Promise<PreparationState>,
+    failureMessage: string,
+    onSuccess?: () => void
+  ) => {
+    if (activeProjectIdRef.current !== projectId) {
+      return;
+    }
+
+    if (
+      resettingProjectsRef.current.has(projectId) ||
+      preparationMutationRef.current !== null
+    ) {
+      setError("Another preparation operation is in progress.");
+      throw new Error("Preparation operation already in progress.");
+    }
+
+    const session = projectSessionRef.current;
+    const request = ++preparationRequestRef.current;
+
+    preparationMutationRef.current = request;
+
+    const isCurrent = () =>
+      isCurrentSession(projectId, session) &&
+      preparationRequestRef.current === request;
+
+    try {
+      setError(null);
+
+      const state = await operation();
+
+      if (!isCurrent()) return;
+
+      setPreparation(state);
+
+      onSuccess?.();
+    } catch (err: unknown) {
+      if (!isCurrent()) return;
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : failureMessage
+      );
+
+      throw err;
+    } finally {
+      if (
+        isCurrentSession(projectId, session) &&
+        preparationMutationRef.current === request
+      ) {
+        preparationMutationRef.current = null;
+      }
+    }
+  }, [isCurrentSession]);
 
   const saveDraft = useCallback(
     async (
-      inclusion: Record<string, any> | null,
+      inclusion: Record<string, unknown> | null,
       exclusions: ManualExclusion[]
     ) => {
-      if (!project) return;
-      try {
-        const state = await savePreparationDraft(
-          project.id,
-          inclusion,
-          exclusions
-        );
-        setPreparation(state);
-        setManualExclusions(exclusions);
-      } catch (err: unknown) {
-        setError(
-          err instanceof Error ? err.message : "Failed to save draft"
-        );
-      }
+      if (!preparationProjectId) return;
+
+      const pid = preparationProjectId;
+
+      await mutatePreparation(
+        pid,
+        () => savePreparationDraft(pid, inclusion, exclusions),
+        "Failed to save draft",
+        () => setManualExclusions(exclusions)
+      );
     },
-    [project]
+    [preparationProjectId, mutatePreparation]
   );
 
   const commitArea = useCallback(async () => {
-    if (!project) return;
-    try {
-      const state = await commitPreparation(project.id);
-      setPreparation(state);
-      setProject((prev) =>
-        prev ? { ...prev, preparation_status: "COMMITTED", is_locked: true } : null
-      );
-    } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : "Failed to commit preparation"
-      );
-    }
-  }, [project]);
+    if (!preparationProjectId) return;
+
+    const pid = preparationProjectId;
+
+    await mutatePreparation(
+      pid,
+      () => commitPreparation(pid),
+      "Failed to commit preparation",
+      () => {
+        setProject((prev) =>
+          prev?.id === pid
+            ? {
+                ...prev,
+                preparation_status: "COMMITTED",
+                is_locked: true,
+              }
+            : prev
+        );
+      }
+    );
+  }, [preparationProjectId, mutatePreparation]);
 
   const unlockArea = useCallback(async () => {
-    if (!project) return;
-    try {
-      const state = await unlockPreparation(project.id);
-      setPreparation(state);
-      setProject((prev) =>
-        prev ? { ...prev, preparation_status: "DRAFT", is_locked: false } : null
-      );
-    } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : "Failed to unlock preparation"
-      );
+    if (!preparationProjectId) return;
+
+    const pid = preparationProjectId;
+
+    await mutatePreparation(
+      pid,
+      () => unlockPreparation(pid),
+      "Failed to unlock preparation",
+      () => {
+        setProject((prev) =>
+          prev?.id === pid
+            ? {
+                ...prev,
+                preparation_status: "DRAFT",
+                is_locked: false,
+              }
+            : prev
+        );
+      }
+    );
+  }, [preparationProjectId, mutatePreparation]);
+
+  // ------------------------------------------------------------
+  // Switch between existing projects
+  // ------------------------------------------------------------
+
+  const switchProject = async (projectId: string) => {
+    const selectedProject = projects.find(
+      (item) => item.id === projectId
+    );
+
+    if (!selectedProject) {
+      setError("Selected project could not be found.");
+      return;
     }
-  }, [project]);
+
+    if (activeProjectIdRef.current === projectId) return;
+
+    activateProjectSession(projectId);
+
+    const session = projectSessionRef.current;
+
+    const isCurrent = () =>
+      isCurrentSession(projectId, session);
+
+    try {
+      setLoading(true);
+      setError(null);
+
+      setValidation(null);
+      setRunStatus(null);
+      setResults(null);
+      setLayers([]);
+      setManualExclusions([]);
+      setPreparation(null);
+      setActiveLayerId("");
+
+      setProject(selectedProject);
+
+      const preparationRequest =
+        ++preparationRequestRef.current;
+
+      try {
+        const state = await getPreparation(projectId);
+
+        if (!isCurrent()) return;
+
+        if (
+          preparationRequestRef.current === preparationRequest
+        ) {
+          setPreparation(state);
+        }
+      } catch (err) {
+        if (isCurrent()) {
+          console.warn(
+            "Could not restore project preparation:",
+            err
+          );
+        }
+      }
+
+      if (!isCurrent()) return;
+
+      if (selectedProject.latest_run_id) {
+        try {
+          const existingRun = await getRunStatus(
+              selectedProject.latest_run_id,
+              selectedProject.id
+            );
+
+          if (!isCurrent()) return;
+
+          if (
+            existingRun.run_id !== selectedProject.latest_run_id ||
+              existingRun.project_id !== selectedProject.id
+          ) {
+            throw new Error("Unexpected restored run identity.");
+          }
+
+          setRunStatus(existingRun);
+
+          if (existingRun.status === "COMPLETED") {
+            await loadRunData(
+              existingRun.run_id,
+              projectId,
+              session
+            );
+          }
+        } catch (err) {
+          if (isCurrent()) {
+            console.warn(
+              "Could not restore the project's latest run:",
+              err
+            );
+          }
+        }
+      }
+    } catch (err: unknown) {
+      if (isCurrent()) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Failed to switch project."
+        );
+      }
+    } finally {
+      if (isCurrent()) {
+        setLoading(false);
+      }
+    }
+  };
+
+  // ------------------------------------------------------------
+  // Create a new project
+  // ------------------------------------------------------------
+
+  const createNewProject = async (
+    name: string,
+    description: string,
+    aoiName: string
+  ) => {
+    if (creationPendingRef.current) {
+      throw new Error("Project creation already in progress.");
+    }
+
+    creationPendingRef.current = true;
+
+    let session = projectSessionRef.current;
+
+    const isCurrent = () =>
+      projectSessionRef.current === session;
+
+    try {
+      setLoading(true);
+      setError(null);
+
+      const newProject = await createProject(
+        name.trim(),
+        description.trim(),
+        aoiName.trim()
+      );
+
+      setProjects((current) =>
+        current.some((item) => item.id === newProject.id)
+          ? current
+          : [...current, newProject]
+      );
+
+      if (!isCurrent()) return;
+
+      activateProjectSession(newProject.id);
+
+      session = projectSessionRef.current;
+
+      setValidation(null);
+      setRunStatus(null);
+      setResults(null);
+      setLayers([]);
+      setManualExclusions([]);
+      setPreparation(null);
+      setActiveLayerId("");
+
+      setProject(newProject);
+
+      const request = ++preparationRequestRef.current;
+
+      try {
+        const state = await getPreparation(newProject.id);
+
+        if (
+          isCurrent() &&
+          preparationRequestRef.current === request
+        ) {
+          setPreparation(state);
+        }
+      } catch (err) {
+        if (isCurrent()) {
+          console.warn(
+            "Could not load new project preparation:",
+            err
+          );
+        }
+      }
+    } catch (err: unknown) {
+      if (isCurrent()) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Failed to create project."
+        );
+      }
+
+      throw err;
+    } finally {
+      creationPendingRef.current = false;
+
+      if (isCurrent()) {
+        setLoading(false);
+      }
+    }
+  };
+
   // ------------------------------------------------------------
   // Clear all analysis data and reset the current project session
   // ------------------------------------------------------------
@@ -331,73 +883,177 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
   const clearAll = async () => {
     if (!project) return;
 
+    const pid = project.id;
+
+    let session = projectSessionRef.current;
+
+    const isCurrent = () =>
+      isCurrentSession(pid, session);
+
+    if (!isCurrent()) return;
+
+    if (
+      resettingProjectsRef.current.has(pid) ||
+      runLaunchesRef.current.has(pid) ||
+      preparationMutationRef.current !== null ||
+      (
+        runStatus &&
+        !["COMPLETED", "FAILED"].includes(runStatus.status)
+      )
+    ) {
+      setError(
+        "Wait for the current project operation to finish."
+      );
+      return;
+    }
+
+    resettingProjectsRef.current.add(pid);
+
     try {
       setLoading(true);
       setError(null);
 
-      // Reset the backend workspace while preserving the project.
-      const reset = await resetProject(project.id);
+      const reset = await resetProject(pid);
 
-      // Clear all frontend analysis state.
+      if (reset.id !== pid) {
+        throw new Error("Unexpected reset project identity.");
+      }
+
+      setProjects((current) =>
+        current.map((item) =>
+          item.id === pid ? reset : item
+        )
+      );
+
+      if (!isCurrent()) return;
+
+      activateProjectSession(pid);
+
+      session = projectSessionRef.current;
+
       setProject(reset);
       setValidation(null);
       setRunStatus(null);
       setResults(null);
       setLayers([]);
       setManualExclusions([]);
-      setActiveLayerId("t2_health");
+      setPreparation(null);
+      setActiveLayerId("");
+
     } catch (err: unknown) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Failed to clear project session"
-      );
+      if (isCurrent()) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Failed to clear project session"
+        );
+      }
     } finally {
-      setLoading(false);
+      resettingProjectsRef.current.delete(pid);
+
+      if (isCurrent()) {
+        setLoading(false);
+      }
     }
   };
+
   // ------------------------------------------------------------
   // Launch analysis
   // ------------------------------------------------------------
 
-  const triggerRun = async (config?: Record<string, any>) => {
+  const triggerRun = async (
+    config?: Record<string, unknown>
+  ) => {
     if (!project) return;
+
+    const pid = project.id;
+    const session = projectSessionRef.current;
+
+    const isCurrent = () =>
+      isCurrentSession(pid, session);
+
+    if (!isCurrent()) return;
+
+    if (
+      resettingProjectsRef.current.has(pid) ||
+      runLaunchesRef.current.has(pid) ||
+      (
+        runStatus &&
+        !["COMPLETED", "FAILED"].includes(runStatus.status)
+      )
+    ) {
+      setError("An analysis is already in progress.");
+      return;
+    }
+
+    runLaunchesRef.current.add(pid);
 
     try {
       setLoading(true);
       setError(null);
 
-      // Clear results from any previous run.
-      setResults(null);
-      setLayers([]);
-      setActiveLayerId("");
-
-      // Preserve the existing analysis configuration and append
-      // the manually excluded polygons and inclusion geometry.
       const runConfig = {
         ...(config || {}),
         manual_exclusions: manualExclusions,
         inclusion_geometry: preparation?.inclusion ?? null,
       };
 
-      console.log(
-        "[GIS DEBUG] manualExclusions before launch:",
-        manualExclusions
-      );
+      const initialRun = await launchRun(pid, runConfig);
 
-      console.log(
-        "[GIS DEBUG] runConfig before launch:",
-        runConfig
-      );
+      if (!isCurrent()) return;
 
-      const initialRun = await launchRun(project.id, runConfig);
+      if (!initialRun.run_id) {
+        throw new Error("Backend returned an invalid run ID.");
+      }
 
-      // The backend-generated run_id is authoritative.
+      resultRequestRef.current += 1;
+
+      setResults(null);
+      setLayers([]);
+      setActiveLayerId("");
       setRunStatus(initialRun);
+
+      setProject((prev) =>
+        prev?.id === pid
+          ? {
+              ...prev,
+              latest_run_id: initialRun.run_id,
+            }
+          : prev
+      );
+
+      setProjects((current) =>
+        current.map((item) =>
+          item.id === pid
+            ? {
+                ...item,
+                latest_run_id: initialRun.run_id,
+              }
+            : item
+        )
+      );
+
+      if (initialRun.status === "COMPLETED") {
+        await loadRunData(
+          initialRun.run_id,
+          pid,
+          session
+        );
+      }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Run failed");
+      if (isCurrent()) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Run failed"
+        );
+      }
     } finally {
-      setLoading(false);
+      runLaunchesRef.current.delete(pid);
+
+      if (isCurrent()) {
+        setLoading(false);
+      }
     }
   };
 
@@ -411,6 +1067,9 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({
     <ProjectContext.Provider
       value={{
         project,
+        projects,
+        createNewProject,
+        switchProject,
         validation,
         runStatus,
         results,

@@ -5,6 +5,7 @@ Router for retrieving map layer catalog and rendering GeoTIFF layers as PNG tile
 """
 
 from pathlib import Path
+from urllib.parse import urlencode
 from typing import List
 from fastapi import APIRouter, HTTPException, Response
 from ..schemas import MapLayerInfo
@@ -24,16 +25,23 @@ LAYER_DEFINITIONS = [
 
 
 @router.get("", response_model=List[MapLayerInfo])
-def get_layer_catalog(run_id: str):
-    run_info = RunWorker.get_run_status(run_id)
+def get_layer_catalog(run_id: str, project_id: str | None = None):
+    run_info = RunWorker.get_run_status(run_id, project_id=project_id)
     if not run_info:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    if run_info.get("status") != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail="Run outputs are not available for an incomplete or failed execution.",
+        )
 
     out_dir = Path(run_info["output_directory"])
     if (out_dir / run_id).is_dir():
         out_dir = out_dir / run_id
 
     layers = []
+    query = urlencode({"project_id": run_info["project_id"]})
 
     for defn in LAYER_DEFINITIONS:
         file_path = out_dir / defn["subpath"]
@@ -50,7 +58,7 @@ def get_layer_catalog(run_id: str):
             id=defn["id"],
             name=defn["name"],
             type=defn["type"],
-            url=f"/api/runs/{run_id}/layers/{defn['id']}/image",
+            url=f"/api/runs/{run_id}/layers/{defn['id']}/image?{query}",
             format="png",
             bounds=bounds,
             crs="EPSG:4326",
@@ -62,10 +70,16 @@ def get_layer_catalog(run_id: str):
 
 
 @router.get("/{layer_id}/image")
-def render_layer_image(run_id: str, layer_id: str):
-    run_info = RunWorker.get_run_status(run_id)
+def render_layer_image(run_id: str, layer_id: str, project_id: str | None = None):
+    run_info = RunWorker.get_run_status(run_id, project_id=project_id)
     if not run_info:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    if run_info.get("status") != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail="Run outputs are not available for an incomplete or failed execution.",
+        )
 
     out_dir = Path(run_info["output_directory"])
     if (out_dir / run_id).is_dir():

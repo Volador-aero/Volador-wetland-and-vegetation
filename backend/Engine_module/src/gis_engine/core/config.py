@@ -87,18 +87,70 @@ def load_config(config_path: Union[str, Path]) -> Dict[str, Any]:
 
 
 def config_hash(config: Dict[str, Any]) -> str:
-    """
-    Returns a SHA-256 hex digest of the serialized configuration.
-    Used for provenance and reproducibility verification.
+    """Hash a valid JSON configuration deterministically."""
+    import math
 
-    Args:
-        config: Configuration dictionary.
+    if not isinstance(config, dict):
+        raise ConfigurationError(
+            "Configuration must be a dictionary."
+        )
 
-    Returns:
-        Hex string SHA-256 digest.
-    """
-    serialized = json.dumps(config, sort_keys=True, ensure_ascii=True).encode("utf-8")
-    return hashlib.sha256(serialized).hexdigest()
+    def validate(value, location="config"):
+
+        if value is None or isinstance(value, (str, bool, int)):
+            return
+
+        if isinstance(value, float):
+
+            if not math.isfinite(value):
+                raise ConfigurationError(
+                    f"Non-finite configuration value at {location}."
+                )
+
+            return
+
+        if isinstance(value, list):
+
+            for index, item in enumerate(value):
+                validate(item, f"{location}[{index}]")
+
+            return
+
+        if isinstance(value, dict):
+
+            for key, item in value.items():
+
+                if not isinstance(key, str):
+                    raise ConfigurationError(
+                        f"Invalid configuration key at {location}."
+                    )
+
+                validate(item, f"{location}.{key}")
+
+            return
+
+        raise ConfigurationError(
+            f"Unsupported configuration value at {location}."
+        )
+
+    try:
+
+        validate(config)
+
+        serialized = json.dumps(
+            config,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+
+        return hashlib.sha256(serialized).hexdigest()
+
+    except (TypeError, ValueError, RecursionError) as exc:
+
+        raise ConfigurationError(
+            "Configuration cannot be safely serialized."
+        ) from exc
 
 
 def save_config_snapshot(config: Dict[str, Any], output_dir: Union[str, Path]) -> Path:
@@ -133,3 +185,99 @@ def save_config_snapshot(config: Dict[str, Any], output_dir: Union[str, Path]) -
 
     logger.debug("Configuration snapshot saved: %s", snapshot_path)
     return snapshot_path
+
+def collect_environment_provenance() -> Dict[str, Any]:
+    """Collect execution environment metadata without changing it."""
+    import sys
+    import platform
+    import subprocess
+    from importlib import metadata
+
+    dependencies = (
+        "numpy",
+        "scipy",
+        "rasterio",
+        "affine",
+        "pyproj",
+        "onnxruntime",
+        "onnxruntime-gpu",
+        "opencv-python",
+        "opencv-python-headless",
+        "shapely",
+        "pandas",
+        "matplotlib",
+        "reportlab",
+        "pypdf",
+        "fastapi",
+        "pydantic",
+        "uvicorn",
+    )
+
+    versions = {}
+
+    for package in dependencies:
+
+        try:
+
+            versions[package] = metadata.version(package)
+
+        except metadata.PackageNotFoundError:
+
+            versions[package] = None
+
+    repo_location = Path(__file__).resolve().parent
+
+    def git_command(arguments):
+
+        try:
+
+            result = subprocess.run(
+                ["git", "-C", str(repo_location), *arguments],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+                shell=False,
+            )
+
+            return result.stdout.strip()
+
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            UnicodeError,
+        ):
+
+            return None
+
+    commit = git_command(
+        ["rev-parse", "HEAD"]
+    )
+
+    working_tree = git_command([
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+    ])
+
+    environment = {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "os": platform.platform(),
+        "architecture": platform.machine(),
+        "dependencies": versions,
+        "git_commit": commit,
+        "git_working_tree_dirty": (
+            bool(working_tree)
+            if working_tree is not None
+            else None
+        ),
+    }
+
+    environment["environment_hash"] = config_hash(
+        environment
+    )
+
+    environment["reproducibility_verified"] = False
+
+    return environment

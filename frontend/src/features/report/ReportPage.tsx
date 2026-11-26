@@ -6,18 +6,31 @@ type ReportPageProps = {
 };
 
 export default function ReportPage({ analysisMode }: ReportPageProps) {
-  const { runStatus, results } = useProject();
+  const { project, runStatus, results } = useProject();
 
-  const isCompleted = runStatus?.status === "COMPLETED";
+  const projectId = project?.id ?? "";
   const runId = runStatus?.run_id ?? "";
-  const pdfUrl = runId ? getPdfReportUrl(runId) : "";
-  const techPdfUrl = runId ? getTechnicalPdfReportUrl(runId) : "";
+
+  const isCompleted = Boolean(
+    projectId &&
+    runId &&
+    runStatus?.project_id === projectId &&
+    runStatus.status === "COMPLETED"
+  );
+
+  const pdfUrl = isCompleted
+    ? getPdfReportUrl(runId, projectId)
+    : "";
+
+  const techPdfUrl = isCompleted
+    ? getTechnicalPdfReportUrl(runId, projectId)
+    : "";
 
   // Prefer the prop (selected mode) over what's stored in results.
   // results?.analysis_mode is only available after a completed run;
   // the prop reflects the user's current UI selection immediately.
   const effectiveMode =
-    analysisMode ?? (results as any)?.analysis_mode ?? "wetland";
+    results?.analysis_mode ?? analysisMode ?? "wetland";
   const isVegetation = effectiveMode === "vegetation";
 
   const simpleReportLabel = isVegetation
@@ -33,33 +46,47 @@ export default function ReportPage({ analysisMode }: ReportPageProps) {
     ? "Full technical audit: band statistics, index formulas, model architecture, class metrics, QA, and provenance."
     : "Full technical audit: 4×4 transition matrix, CVA displacements, NDWI dynamics, fusion rules, QA, and provenance.";
 
+  const qa = isCompleted ? results?.validation : undefined;
+
+  const getCheck = (key: string): string => {
+    if (!isCompleted) return "PENDING";
+
+    const checks = qa?.checks;
+
+    if (!checks || typeof checks !== "object") {
+      return "NOT_REPORTED";
+    }
+
+    const value = (checks as Record<string, unknown>)[key];
+
+    if (typeof value === "string") return value;
+
+    if (value && typeof value === "object") {
+      const status = (value as Record<string, unknown>).status;
+      if (typeof status === "string") return status;
+    }
+
+    return "NOT_REPORTED";
+  };
+
   const reportChecks = [
-    { label: "Input Validation", state: "PASS" },
+    { label: "Input Validation", state: getCheck("input") },
+    { label: "Model Validation", state: getCheck("model") },
+    { label: "Class Statistics", state: getCheck("class_distribution") },
+    { label: "Vegetation Indices", state: getCheck("vegetation_index") },
+    ...(!isVegetation ? [
+      { label: "Transition Matrix", state: getCheck("transition") },
+      { label: "Change Vector Analysis", state: getCheck("cva") },
+      { label: "Area Metrics", state: getCheck("metrics") },
+    ] : []),
     {
-      label: isVegetation ? "Scene Spectral Inference" : "T1 → T2 Spectral Inference",
-      state: isCompleted ? "PASS" : "PENDING",
+      label: "Quality Assurance Validation",
+      state: isCompleted
+        ? qa?.overall_status ?? qa?.status ?? "NOT_REPORTED"
+        : "PENDING",
     },
-    {
-      label: isVegetation ? "Class Statistics" : "4×4 Transition Matrix",
-      state: isCompleted ? "PASS" : "PENDING",
-    },
-    {
-      label: isVegetation ? "Vegetation Index Computation" : "Change Vector Analysis (CVA)",
-      state: isCompleted ? "PASS" : "PENDING",
-    },
-    { label: "Area Statistics & Degradation", state: isCompleted ? "PASS" : "PENDING" },
-    { label: "Quality Assurance Validation", state: isCompleted ? "PASS" : "PENDING" },
-    {
-      label: "Independent Validation",
-      state: "NOT_AVAILABLE",
-    },
-    {
-      label: "Independent Wetland Evidence",
-      state:
-        !isVegetation && (results as any)?.metrics?.wetland_boundary_used
-          ? "AVAILABLE"
-          : "NOT_AVAILABLE",
-    },
+    { label: "Uncertainty", state: getCheck("uncertainty") },
+    { label: "Reproducibility", state: getCheck("reproducibility") },
   ];
 
   return (

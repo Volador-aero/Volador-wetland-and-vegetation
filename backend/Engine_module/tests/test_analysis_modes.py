@@ -144,7 +144,7 @@ def run_vegetation_mode(tmp_path: Path, monkeypatch):
         t1_date=None,   # Vegetation mode: date optional (single-date)
         t2_date=None,
         config_path=config_path,
-        model_path=t1_dir / "scene_G.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_base_dir=output_dir,
         run_id="run_vegetation",
     )
@@ -176,7 +176,7 @@ def run_wetland_mode(tmp_path: Path, monkeypatch):
         t1_date="2026-08-01",
         t2_date="2026-08-15",
         config_path=config_path,
-        model_path=t1_dir / "scene_G.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_base_dir=output_dir,
         run_id="run_wetland",
     )
@@ -328,7 +328,7 @@ def test_wetland_mode_requires_t2_scene(tmp_path, monkeypatch):
         t1_date="2026-08-01",
         t2_date=None,
         config_path=config_path,
-        model_path=t1_dir / "scene_G.tif",
+        model_path=_create_valid_qa_model(tmp_path),
         output_base_dir=output_dir,
         run_id="run_wetland_no_t2",
     )
@@ -357,3 +357,70 @@ def test_dispatcher_mode_field_controls_branch():
     # Default (no analysis_mode key) must be "wetland" for backward compatibility
     default = AnalysisDispatcher.from_config({})
     assert default.is_wetland is True
+
+
+def _create_valid_qa_model(directory):
+    """Create a valid synthetic ONNX model for mocked integration tests."""
+
+    import numpy as np
+    import onnx
+
+    from onnx import helper, TensorProto, numpy_helper
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    model_path = directory / "qa_test_model.onnx"
+
+    model_input = helper.make_tensor_value_info(
+        "input",
+        TensorProto.FLOAT,
+        [1, 5, "height", "width"],
+    )
+
+    model_output = helper.make_tensor_value_info(
+        "output",
+        TensorProto.FLOAT,
+        [1, 4, "height", "width"],
+    )
+
+    weights = numpy_helper.from_array(
+        np.zeros((4, 5, 1, 1), dtype=np.float32),
+        name="weights",
+    )
+
+    bias = numpy_helper.from_array(
+        np.array([0, 0, 0, 10], dtype=np.float32),
+        name="bias",
+    )
+
+    convolution = helper.make_node(
+        "Conv",
+        ["input", "weights", "bias"],
+        ["output"],
+        kernel_shape=[1, 1],
+    )
+
+    graph = helper.make_graph(
+        [convolution],
+        "synthetic_qa_test_model",
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13)
+        ],
+        producer_name="integration-test-fixture",
+    )
+
+    model.ir_version = 8
+
+    onnx.checker.check_model(model)
+
+    onnx.save(model, str(model_path))
+
+    return model_path

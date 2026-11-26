@@ -125,7 +125,7 @@ const mockContextValue: ProjectContextType = {
     status: "CREATED",
     datasets_ready: true,
     is_locked: false,
-  } as any,
+  } as NonNullable<ProjectContextType["project"]>,
   validation: null,
   runStatus: null,
   results: null,
@@ -140,7 +140,7 @@ const mockContextValue: ProjectContextType = {
     is_locked: false,
     inclusion: null,
     manual_exclusions: [],
-    metrics: {} as any,
+    metrics: {} as NonNullable<ProjectContextType["preparation"]>["metrics"],
     updated_at: new Date().toISOString(),
   },
   addManualExclusion: vi.fn(),
@@ -161,7 +161,7 @@ const mockContextValue: ProjectContextType = {
 
 async function renderWithContext(ui: React.ReactElement, ctxOverrides: Partial<ProjectContextType> = {}) {
   const value = { ...mockContextValue, ...ctxOverrides };
-  let result: any;
+  let result!: ReturnType<typeof render>;
   await act(async () => {
     result = render(
       <ProjectContext.Provider value={value}>

@@ -92,9 +92,9 @@ def launch_run(payload: RunCreateRequest):
 
     print(
         "[GIS DEBUG] backend config dict:",
-        payload.config.dict() if payload.config else None,
+        payload.config.model_dump() if payload.config else None,
     )
-    config_dict = payload.config.dict() if payload.config else None
+    config_dict = payload.config.model_dump() if payload.config else None
     try:
         run_info = RunWorker.start_run(payload.project_id, config_dict)
     except ValueError as exc:
@@ -106,8 +106,8 @@ def launch_run(payload: RunCreateRequest):
 
 
 @router.get("/{run_id}", response_model=RunStatusResponse)
-def get_run_status(run_id: str):
-    run_info = RunWorker.get_run_status(run_id)
+def get_run_status(run_id: str, project_id: str | None = None):
+    run_info = RunWorker.get_run_status(run_id, project_id=project_id)
     if not run_info:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     return run_info

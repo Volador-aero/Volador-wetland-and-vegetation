@@ -6,13 +6,14 @@ and GIS layer tile rendering.
 """
 
 import re
+import ntpath
 import sys
 import json
 import logging
 import io
 import time
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 from concurrent.futures import ThreadPoolExecutor
@@ -46,7 +47,7 @@ RUN_STATES: Dict[str, Dict[str, Any]] = {}
 
 
 def now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _extract_date_from_directory(directory: Path) -> Optional[str]:
@@ -68,6 +69,82 @@ def _extract_date_from_directory(directory: Path) -> Optional[str]:
                 return f"{year}-{month}-{day}"
     return None
 
+
+
+# Serialize run submission and destructive project operations.
+from threading import RLock
+from functools import wraps
+from fastapi import HTTPException
+
+_PROJECT_LIFECYCLE_LOCK = RLock()
+_RUN_FUTURES = {}
+
+
+def _serialize_project_lifecycle(method):
+    """Prevent concurrent submission and workspace removal."""
+
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        with _PROJECT_LIFECYCLE_LOCK:
+            return method(*args, **kwargs)
+
+    return wrapped
+
+
+def _assert_project_idle(project_id):
+    """Reject workspace removal while a worker owns its files."""
+
+    with _PROJECT_LIFECYCLE_LOCK:
+
+        for run_id, run_info in RUN_STATES.items():
+
+            if run_info.get("project_id") != project_id:
+                continue
+
+            future = _RUN_FUTURES.get(run_id)
+
+            if future is not None:
+                active = not future.done()
+            else:
+                active = run_info.get("status") not in {
+                    "COMPLETED",
+                    "FAILED",
+                    "CANCELLED",
+                }
+
+            if active:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Project has an active analysis run. "
+                        "Wait for completion before deleting "
+                        "or resetting the project."
+                    ),
+                )
+
+
+def _forget_finished_project_runs(project_id):
+    """Remove completed worker references and cached run states."""
+
+    with _PROJECT_LIFECYCLE_LOCK:
+
+        run_ids = [
+            run_id
+            for run_id, info in RUN_STATES.items()
+            if info.get("project_id") == project_id
+        ]
+
+        for run_id in run_ids:
+
+            future = _RUN_FUTURES.get(run_id)
+
+            if future is not None and not future.done():
+                raise RuntimeError(
+                    "Cannot remove an active worker."
+                )
+
+            _RUN_FUTURES.pop(run_id, None)
+            RUN_STATES.pop(run_id, None)
 
 class ProjectStore:
     """Manages project workspaces and dataset configurations on disk."""
@@ -144,7 +221,9 @@ class ProjectStore:
         return projects.get(project_id)
 
     @classmethod
+    @_serialize_project_lifecycle
     def delete_project(cls, project_id: str) -> bool:
+        _assert_project_idle(project_id)
         projects = cls.load_projects()
         if project_id in projects:
             del projects[project_id]
@@ -152,10 +231,12 @@ class ProjectStore:
             proj_dir = STORAGE_DIR / "projects" / project_id
             if proj_dir.exists():
                 shutil.rmtree(proj_dir, ignore_errors=True)
+            _forget_finished_project_runs(project_id)
             return True
         return False
 
     @classmethod
+    @_serialize_project_lifecycle
     def reset_project(cls, project_id: str) -> Optional[Dict[str, Any]]:
         """
         Reset a project workspace to a blank analysis session.
@@ -165,6 +246,7 @@ class ProjectStore:
         Project metadata related to analysis state is reset.
         """
 
+        _assert_project_idle(project_id)
         projects = cls.load_projects()
 
         if project_id not in projects:
@@ -230,14 +312,7 @@ class ProjectStore:
         # Remove in-memory run states belonging to this project
         # --------------------------------------------------------
 
-        run_ids_to_remove = [
-            run_id
-            for run_id, run_info in RUN_STATES.items()
-            if run_info.get("project_id") == project_id
-        ]
-
-        for run_id in run_ids_to_remove:
-            RUN_STATES.pop(run_id, None)
+        _forget_finished_project_runs(project_id)
 
         # --------------------------------------------------------
         # Reset project metadata
@@ -560,6 +635,7 @@ class RunWorker:
     """Manages background async execution of the GIS engine pipeline."""
 
     @classmethod
+    @_serialize_project_lifecycle
     def start_run(cls, project_id: str, config_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         project = ProjectStore.get_project(project_id)
         if not project:
@@ -589,7 +665,9 @@ class RunWorker:
             ProjectStore.save_preparation(project_id, prep)
             ProjectStore.update_project(project_id, {"preparation_status": "COMMITTED", "is_locked": True, "status": "PREPARATION_COMMITTED"})
 
-        run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        from uuid import uuid4
+        from datetime import timezone
+        run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
         runs_dir = STORAGE_DIR / "projects" / project_id / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
         run_output_dir = runs_dir / run_id
@@ -611,7 +689,11 @@ class RunWorker:
         RUN_STATES[run_id] = run_info
 
         # Launch background task
-        executor.submit(cls._execute_pipeline, run_id, project, run_output_dir, config_overrides)
+        try:
+            _RUN_FUTURES[run_id] = executor.submit(cls._execute_pipeline, run_id, project, run_output_dir, config_overrides)
+        except Exception:
+            RUN_STATES.pop(run_id, None)
+            raise
         return run_info
 
     @classmethod
@@ -625,8 +707,10 @@ class RunWorker:
         try:
             config_path = ENGINE_SRC.parent / "configs" / "config.json"
             model_path = ENGINE_SRC.parent / "models" / "best_finetuned_model.onnx"
-            if not model_path.exists():
-                model_path = config_path
+            if not model_path.is_file():
+                raise FileNotFoundError(
+                    f"Required ONNX model not found: {model_path}"
+                )
 
             # If caller supplied custom run configurations, write a runtime config snapshot
             if config_overrides and isinstance(config_overrides, dict):
@@ -662,11 +746,59 @@ class RunWorker:
                             base_cfg["inclusion_geometry"] = prep.get("inclusion")
 
                     custom_cfg_path = output_dir.parent / f".{run_id}_run_config.json"
-                    with open(custom_cfg_path, "w", encoding="utf-8") as cf:
-                        json.dump(base_cfg, cf, indent=2)
-                    config_path = custom_cfg_path
+                    import os
+                    import tempfile
+
+                    if not custom_cfg_path.parent.is_dir():
+                        raise FileNotFoundError(
+                            "Run configuration directory is missing."
+                        )
+
+                    temporary_path = None
+
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="w",
+                            encoding="utf-8",
+                            dir=custom_cfg_path.parent,
+                            prefix=f".{run_id}_",
+                            suffix=".tmp",
+                            delete=False,
+                        ) as cf:
+                            temporary_path = Path(cf.name)
+                            json.dump(
+                                base_cfg,
+                                cf,
+                                indent=2,
+                                allow_nan=False,
+                            )
+                            cf.flush()
+                            os.fsync(cf.fileno())
+
+                        os.replace(
+                            temporary_path,
+                            custom_cfg_path,
+                        )
+
+                        with custom_cfg_path.open(
+                            "r", encoding="utf-8"
+                        ) as cf:
+                            persisted_config = json.load(cf)
+
+                        if persisted_config != base_cfg:
+                            raise RuntimeError(
+                                "Configuration snapshot verification failed."
+                            )
+
+                        config_path = custom_cfg_path
+
+                    finally:
+                        if temporary_path is not None:
+                            temporary_path.unlink(missing_ok=True)
                 except Exception as exc:
-                    logger.warning("Failed to write config_overrides snapshot: %s", exc)
+                    raise RuntimeError(
+                        "Unable to persist verified run configuration."
+                    ) from exc
 
             t1_dir = Path(project["t1_dir"])
             t2_dir = Path(project["t2_dir"])
@@ -821,101 +953,470 @@ class RunWorker:
             run_info["error"] = str(e)
 
     @classmethod
-    def get_run_status(cls, run_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Return run status from in-memory state when available.
+    def get_run_status(
+        cls,
+        run_id: str,
+        project_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Recover run state without treating incomplete runs as successful."""
 
-        Completed runs must remain discoverable after a backend restart/reload,
-        so fall back to the persistent run directory and manifest.json.
-        """
+        import re
 
-        # Fast path for currently running / recently completed runs.
-        run_info = RUN_STATES.get(run_id)
-        if run_info is not None:
-            return run_info
+        from pathlib import PureWindowsPath
 
-        # Persistent recovery path.
-        # A run directory is authoritative evidence that the run exists.
-        projects_dir = STORAGE_DIR / "projects"
+        from gis_engine.core.pipeline import (
+            _file_sha256,
+            _verify_output_manifest,
+        )
 
-        if not projects_dir.exists():
+        if (
+            not isinstance(run_id, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9_-]+", run_id
+            ) is None
+            or ntpath.isreserved(run_id)
+        ):
             return None
 
-        for project_dir in projects_dir.iterdir():
-            if not project_dir.is_dir():
-                continue
+        from fastapi import HTTPException
 
-            run_dir = project_dir / "runs" / run_id
-            if not run_dir.is_dir():
-                continue
+        if project_id is not None and (
+            not isinstance(project_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]+", project_id) is None
+            or ntpath.isreserved(project_id)
+        ):
+            return None
 
-            manifest_path = run_dir / "manifest.json"
-            metadata_path = run_dir / "metadata.json"
+        run_info = RUN_STATES.get(run_id)
 
-            persisted: Dict[str, Any] = {}
+        def safe_directory(directory):
+            return (
+                directory.is_dir()
+                and not directory.is_symlink()
+                and not getattr(
+                    directory, "is_junction", lambda: False
+                )()
+            )
 
-            # Prefer manifest.json because it is explicitly run-level metadata.
-            if manifest_path.exists():
-                try:
-                    with manifest_path.open("r", encoding="utf-8") as f:
-                        manifest = json.load(f)
-
-                    if isinstance(manifest, dict):
-                        persisted.update(manifest)
-                except (OSError, json.JSONDecodeError):
-                    pass
-
-            # Metadata can provide additional persisted information.
-            if metadata_path.exists():
-                try:
-                    with metadata_path.open("r", encoding="utf-8") as f:
-                        metadata = json.load(f)
-
-                    if isinstance(metadata, dict):
-                        for key, value in metadata.items():
-                            persisted.setdefault(key, value)
-                except (OSError, json.JSONDecodeError):
-                    pass
-
-            # Reconstruct the API run object using persisted information.
-            recovered: Dict[str, Any] = {
-                "run_id": run_id,
-                "project_id": project_dir.name,
-                "status": persisted.get("status", "COMPLETED"),
-                "progress": persisted.get("progress", 100),
-                "current_step": persisted.get("current_step", "COMPLETED"),
-                "created_at": persisted.get("created_at", ""),
-                "started_at": persisted.get("started_at"),
-                "completed_at": persisted.get("completed_at"),
-                "message": persisted.get(
-                    "message",
-                    "Run recovered from persistent storage."
-                ),
-                "output_directory": str(run_dir),
-            }
-
-            if persisted.get("error"):
-                recovered["error"] = persisted["error"]
-
-            # If the persistent outputs exist but the manifest does not contain
-            # an explicit terminal status, the presence of analysis_result.json
-            # and the final report provides a deterministic completion signal.
-            analysis_result = run_dir / "analysis_result.json"
-            final_report = run_dir / "reports" / "FINAL_ANALYSIS_REPORT.pdf"
+        def read_json(file_path):
 
             if (
-                recovered["status"] not in {"FAILED"}
-                and analysis_result.exists()
-                and final_report.exists()
+                not file_path.is_file()
+                or file_path.is_symlink()
+                or getattr(
+                    file_path, "is_junction", lambda: False
+                )()
             ):
-                recovered["status"] = "COMPLETED"
-                recovered["progress"] = 100
-                recovered["current_step"] = "COMPLETED"
+                raise ValueError(
+                    "Missing or unsafe JSON file."
+                )
 
-            # Cache the recovered state so subsequent requests are cheap.
-            RUN_STATES[run_id] = recovered
+            with file_path.open(
+                "r", encoding="utf-8"
+            ) as stream:
 
-            return recovered
+                value = json.load(stream)
+
+            if not isinstance(value, dict):
+                raise ValueError(
+                    "Expected JSON object."
+                )
+
+            return value
+
+        projects_dir = STORAGE_DIR / "projects"
+
+        if not safe_directory(projects_dir):
+            return None
+
+        matching_projects = []
+
+        candidates = (
+            [projects_dir / project_id]
+            if project_id is not None
+            else list(projects_dir.iterdir())
+        )
+
+        for project_dir in candidates:
+
+            if not safe_directory(project_dir):
+                continue
+
+            runs_dir = project_dir / "runs"
+
+            if not safe_directory(runs_dir):
+                continue
+
+            run_dir = runs_dir / run_id
+
+            if not safe_directory(run_dir):
+                continue
+
+            matching_projects.append(project_dir)
+
+        if len(matching_projects) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Ambiguous historical run ID. "
+                    "Specify project_id."
+                ),
+            )
+
+        if run_info is not None:
+            cached_project = run_info.get("project_id")
+
+            valid_cached_identity = (
+                isinstance(cached_project, str)
+                and re.fullmatch(
+                    r"[A-Za-z0-9_-]+", cached_project
+                ) is not None
+                and not ntpath.isreserved(cached_project)
+                and run_info.get("run_id") == run_id
+            )
+
+            if valid_cached_identity:
+                if (
+                    project_id is None
+                    and matching_projects
+                    and matching_projects[0].name
+                        != cached_project
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Ambiguous run ID across live "
+                            "and stored projects. "
+                            "Specify project_id."
+                        ),
+                    )
+
+                project_matches = (
+                    project_id is None
+                    or cached_project == project_id
+                )
+
+                directory_matches = (
+                    not matching_projects
+                    or matching_projects[0].name
+                        == cached_project
+                )
+
+                if project_matches and directory_matches:
+                    # Live failures must never be replaced
+                    # by an older successful disk status.
+                    # Completed runs still require disk
+                    # integrity verification.
+                    if run_info.get("status") != "COMPLETED":
+                        return run_info
+
+        for project_dir in matching_projects:
+
+            run_dir = project_dir / "runs" / run_id
+
+            recovered = {
+                "run_id": run_id,
+                "project_id": project_dir.name,
+                "status": "FAILED",
+                "execution_status": "FAILED",
+                "progress": 0,
+                "current_step": "FAILED",
+                "created_at": "",
+                "started_at": None,
+                "completed_at": None,
+                "message": "Run recovered from persistent storage.",
+                "output_directory": str(run_dir),
+                "error": None,
+                "warnings": [],
+                "errors": [],
+                "manifest_integrity_verified": False,
+            }
+
+            def fail(message):
+
+                recovered.update({
+                    "status": "FAILED",
+                    "execution_status": "FAILED",
+                    "progress": 0,
+                    "current_step": "FAILED",
+                    "message": message,
+                    "error": message,
+                    "errors": [message],
+                    "manifest_integrity_verified": False,
+                })
+
+                return recovered
+
+            terminal_path = run_dir / "run_status.json"
+
+            manifest_path = run_dir / "manifest.json"
+
+            integrity_path = (
+                run_dir / "manifest_integrity.json"
+            )
+
+            metadata_path = run_dir / "metadata.json"
+
+            try:
+
+                metadata = (
+                    read_json(metadata_path)
+                    if metadata_path.exists()
+                    else {}
+                )
+
+                modern_run = (
+                    "initial_provenance" in metadata
+                    or "manifest_integrity_report" in metadata
+                    or integrity_path.exists()
+                )
+
+                if (
+                    terminal_path.exists()
+                    or terminal_path.is_symlink()
+                ):
+
+                    terminal = read_json(terminal_path)
+
+                    if (
+                        type(terminal.get("schema_version")) is not int
+                        or terminal["schema_version"] != 1
+                        or terminal.get("run_id") != run_id
+                        or terminal.get("terminal") is not True
+                    ):
+                        return fail(
+                            "Invalid persisted terminal status."
+                        )
+
+                    execution = terminal.get(
+                        "execution_status"
+                    )
+
+                    if execution not in (
+                        "SUCCESS", "WARNING", "FAILED"
+                    ):
+                        return fail(
+                            "Invalid persisted execution status."
+                        )
+
+                    warnings = terminal.get("warnings", [])
+                    errors = terminal.get("errors", [])
+
+                    if (
+                        not isinstance(warnings, list)
+                        or not isinstance(errors, list)
+                        or not all(
+                            isinstance(item, str)
+                            for item in warnings + errors
+                        )
+                    ):
+                        return fail(
+                            "Invalid persisted execution findings."
+                        )
+
+                    if execution == "FAILED":
+
+                        recovered.update({
+                            "completed_at": terminal.get(
+                                "completed_at"
+                            ),
+                            "warnings": warnings,
+                            "errors": errors,
+                            "error": terminal.get("error")
+                                or "Pipeline execution failed.",
+                            "message": "Recovered failed execution.",
+                        })
+
+                        return recovered
+
+                    if (
+                        terminal.get("status") != "COMPLETED"
+                        or terminal.get("progress") != 100
+                        or terminal.get("qa_status")
+                            not in ("PASS", "WARN")
+                        or terminal.get(
+                            "manifest_integrity_status"
+                        ) != "PASS"
+                        or terminal.get(
+                            "manifest_integrity_verified"
+                        ) is not True
+                        or errors
+                        or (
+                            execution == "SUCCESS"
+                            and (
+                                warnings
+                                or terminal.get("qa_status") != "PASS"
+                            )
+                        )
+                    ):
+                        return fail(
+                            "Persisted completion status is inconsistent."
+                        )
+
+                    manifest = read_json(manifest_path)
+
+                    integrity = read_json(integrity_path)
+
+                    recorded_hash = terminal.get(
+                        "manifest_sha256"
+                    )
+
+                    if (
+                        not isinstance(recorded_hash, str)
+                        or re.fullmatch(
+                            r"[0-9a-f]{64}",
+                            recorded_hash
+                        ) is None
+                        or _file_sha256(manifest_path)
+                            != recorded_hash
+                        or integrity.get("manifest_sha256")
+                            != recorded_hash
+                        or integrity.get("run_id") != run_id
+                        or integrity.get("status") != "PASS"
+                        or integrity.get(
+                            "integrity_verified"
+                        ) is not True
+                    ):
+                        return fail(
+                            "Persisted manifest integrity mismatch."
+                        )
+
+                    verification = _verify_output_manifest(
+                        run_dir,
+                        manifest,
+                        run_id,
+                    )
+
+                    if (
+                        verification.get("status") != "PASS"
+                        or verification.get(
+                            "integrity_verified"
+                        ) is not True
+                    ):
+                        return fail(
+                            "Recovered output checksum verification failed."
+                        )
+
+                    qa = read_json(
+                        run_dir / "validation" / "qa_report.json"
+                    )
+
+                    if qa.get("overall_status") != terminal.get(
+                        "qa_status"
+                    ):
+                        return fail(
+                            "Persisted QA status mismatch."
+                        )
+
+                    recovered.update({
+                        "status": "COMPLETED",
+                        "execution_status": execution,
+                        "progress": 100,
+                        "current_step": "COMPLETED",
+                        "completed_at": terminal.get(
+                            "completed_at"
+                        ),
+                        "message": terminal.get(
+                            "message",
+                            "Analysis recovered successfully."
+                        ),
+                        "warnings": warnings,
+                        "errors": [],
+                        "error": None,
+                        "qa_status": terminal["qa_status"],
+                        "manifest_integrity_verified": True,
+                    })
+
+
+                    return recovered
+
+                # Modern runs require an explicit terminal record.
+
+                if modern_run:
+                    return fail(
+                        "Execution interrupted or terminal status missing."
+                    )
+
+                # Compatibility recovery for older completed runs.
+
+                manifest = read_json(manifest_path)
+
+                result = read_json(
+                    run_dir / "analysis_result.json"
+                )
+
+                report_path = (
+                    run_dir
+                    / "reports"
+                    / "FINAL_ANALYSIS_REPORT.pdf"
+                )
+
+                if (
+                    manifest.get("run_id") != run_id
+                    or not report_path.is_file()
+                    or report_path.is_symlink()
+                    or report_path.stat().st_size == 0
+                ):
+                    return fail(
+                        "Legacy run completion evidence is incomplete."
+                    )
+
+                if any(
+                    item.get("status") in ("FAILED", "ERROR")
+                    for item in (manifest, metadata, result)
+                ):
+                    return fail(
+                        "Legacy execution contains a recorded failure."
+                    )
+
+                if (
+                    "integrity_scope" in manifest
+                    or "verification_report" in manifest
+                ):
+                    return fail(
+                        "Modern manifest has no terminal status."
+                    )
+
+                qa_path = (
+                    run_dir / "validation" / "qa_report.json"
+                )
+
+                if qa_path.exists():
+
+                    qa = read_json(qa_path)
+
+                    if qa.get("overall_status") in (
+                        "FAIL", "ERROR"
+                    ):
+                        return fail(
+                            "Legacy execution contains critical QA failures."
+                        )
+
+                recovered.update({
+                    "status": "COMPLETED",
+                    "execution_status": "WARNING",
+                    "progress": 100,
+                    "current_step": "COMPLETED",
+                    "message": (
+                        "Legacy run recovered without verified integrity."
+                    ),
+                    "warnings": [
+                        "Legacy run has no verified terminal status."
+                    ],
+                    "legacy_recovery": True,
+                    "manifest_integrity_verified": False,
+                    "error": None,
+                })
+
+
+                return recovered
+
+            except Exception as exc:
+
+                return fail(
+                    "Persistent run recovery failed: "
+                    + type(exc).__name__
+                )
 
         return None
 

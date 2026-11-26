@@ -26,7 +26,7 @@ type AnalysisConfigProps = {
       | "inputQaEnabled"
       | "temporalQaEnabled"
       | "changeQaEnabled",
-    value?: any
+    value?: AnalysisMode | boolean
   ) => void;
 };
 

@@ -260,8 +260,16 @@ export default function PrepareAreaPage({ analysisMode }: PrepareAreaPageProps) 
    * We keep `previewTp` as the internal source identifier; it is only exposed
    * as a UI toggle in wetland mode.
    */
-  const [previewTp, setPreviewTp] = useState<"t1" | "t2">("t1");
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [selectedPreviewTp, setPreviewTp] =
+    useState<"t1" | "t2">("t1");
+
+  const previewTp =
+    isVegetationMode ? "t1" : selectedPreviewTp;
+
+  const projectId = project?.id;
+  const previewUrl = projectId
+    ? getDatasetPreviewImageUrl(projectId, previewTp)
+    : null;
 
   // local UI
   const [drawMode, setDrawMode] = useState<DrawMode>("none");
@@ -289,49 +297,73 @@ export default function PrepareAreaPage({ analysisMode }: PrepareAreaPageProps) 
   const isCommitted = preparation?.status === "COMMITTED";
   const hasDraft = preparation?.status === "DRAFT" || inclusionGeom !== null;
 
-  // When switching to vegetation mode, always force previewTp back to "t1"
-  // so stale "t2" selection from a prior wetland session does not persist.
-  useEffect(() => {
+  const [previousMode, setPreviousMode] =
+    useState(analysisMode);
+
+  if (previousMode !== analysisMode) {
+    setPreviousMode(analysisMode);
+
     if (isVegetationMode) {
       setPreviewTp("t1");
     }
-  }, [isVegetationMode]);
+  }
 
-  // ── fetch on mount ───────────────────────────────────────────────────────
+  const [previousMetrics, setPreviousMetrics] =
+    useState(preparation?.metrics);
+
+  if (previousMetrics !== preparation?.metrics) {
+    setPreviousMetrics(preparation?.metrics);
+    setMetrics(preparation?.metrics ?? null);
+  }
+
   useEffect(() => {
-    if (!project) return;
+    if (!projectId) return;
+
+    let cancelled = false;
+
     viewFittedRef.current = false;
 
-    fetchPreparation(project.id).then((prep) => {
-      if (prep?.inclusion) setInclusionGeom(prep.inclusion as Record<string, unknown>);
-      if (prep?.metrics) setMetrics(prep.metrics);
+    void fetchPreparation(projectId).then((prep) => {
+      if (cancelled) return;
+
+      setInclusionGeom(
+        prep?.inclusion
+          ? prep.inclusion as Record<string, unknown>
+          : null
+      );
+
+      setMetrics(prep?.metrics ?? null);
+    }).catch(() => {
+      if (!cancelled) {
+        setOpError("Unable to load preparation data.");
+      }
     });
 
-    getDatasetPreviewInfo(project.id)
+    void getDatasetPreviewInfo(projectId)
       .then((info) => {
-        if (info.width && info.height) {
+        if (cancelled) return;
+
+        if (
+          Number.isInteger(info.width) &&
+          Number.isInteger(info.height) &&
+          info.width > 0 &&
+          info.height > 0
+        ) {
           setRasterW(info.width);
           setRasterH(info.height);
         }
       })
-      .catch(() => {/* use defaults */});
+      .catch(() => {
+        if (!cancelled) {
+          setOpError("Unable to load raster preview metadata.");
+        }
+      });
 
-    setPreviewUrl(getDatasetPreviewImageUrl(project.id, "t1"));
-  }, [project?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, fetchPreparation]);
 
-  useEffect(() => {
-    if (!project) return;
-    // In vegetation mode, always use "t1" regardless of previewTp state.
-    const tp = isVegetationMode ? "t1" : previewTp;
-    setPreviewUrl(getDatasetPreviewImageUrl(project.id, tp));
-  }, [previewTp, project?.id, isVegetationMode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── sync metrics after preparation update ─────────────────────────────────
-  useEffect(() => {
-    if (preparation?.metrics) setMetrics(preparation.metrics);
-  }, [preparation?.metrics]);
-
-  // ── init OL map ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (!mapRef.current || mapInstanceRef.current) return;
 

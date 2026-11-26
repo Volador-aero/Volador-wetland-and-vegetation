@@ -31,26 +31,34 @@ export default function ResultsPage() {
       : "—";
 
   let waterNetStr = "—";
-  if (typeof hydro.net_water_change_ha === "number") {
+  if (
+    typeof hydro.net_water_change_ha === "number" &&
+    Number.isFinite(hydro.net_water_change_ha)
+  ) {
     waterNetStr = `${hydro.net_water_change_ha.toFixed(2)} ha`;
   } else if (
-    hydro.water_gain_area_ha !== undefined ||
-    hydro.water_loss_area_ha !== undefined
+    typeof hydro.water_gain_area_ha === "number" &&
+    Number.isFinite(hydro.water_gain_area_ha) &&
+    typeof hydro.water_loss_area_ha === "number" &&
+    Number.isFinite(hydro.water_loss_area_ha)
   ) {
-    const gain =
-      typeof hydro.water_gain_area_ha === "number" ? hydro.water_gain_area_ha : 0;
-    const loss =
-      typeof hydro.water_loss_area_ha === "number" ? hydro.water_loss_area_ha : 0;
-    waterNetStr = `${(gain - loss).toFixed(2)} ha`;
+    waterNetStr = `${(
+      hydro.water_gain_area_ha - hydro.water_loss_area_ha
+    ).toFixed(2)} ha`;
   }
 
-  const boundaryUsed = Boolean(
-    results?.metrics?.wetland_boundary_used ||
-      (results?.wetland?.status &&
-        !["WETLAND_BOUNDARY_UNAVAILABLE", "UNAVAILABLE"].includes(
-          results.wetland.status
-        ))
-  );
+  const analysisScope = results?.metrics?.analysis_scope;
+
+  const boundaryUsed =
+    analysisScope === "WETLAND_CONTEXT" &&
+    results?.metrics?.wetland_context_available === true;
+
+  const scopeDescription =
+    analysisScope === "GENERAL_VEGETATION"
+      ? "General vegetation metrics within the effective analysis footprint. These are not verified wetland metrics."
+      : boundaryUsed
+        ? "Wetland-context metrics evaluated. Independent wetland membership is not established by this status."
+        : "Wetland analysis scope is unavailable or was not reported. Independent wetland evidence has not been established.";
 
   // ── Vegetation metrics (only used in vegetation mode) ────────────────────
   const vegClasses =
@@ -252,14 +260,12 @@ export default function ResultsPage() {
             </div>
 
             <div className="mt-1 text-xs text-[var(--text-secondary)]">
-              Physical wetland depletion is claimed only when independent
-              wetland spatial evidence is available.
+              Vegetation degradation and surface water change do not
+              independently establish physical wetland depletion.
             </div>
 
             <div className="mt-4 rounded-md border border-[var(--border)] bg-[var(--background)] p-4 text-xs text-[var(--text-secondary)]">
-              {boundaryUsed
-                ? "✓ Independent wetland spatial boundary active — restricted metrics evaluated."
-                : "WETLAND_BOUNDARY_UNAVAILABLE — Metrics evaluated over full aligned scene bounding box."}
+              {scopeDescription}
             </div>
           </section>
         </>

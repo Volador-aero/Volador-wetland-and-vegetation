@@ -43,7 +43,24 @@ def _load_input_raster(val: Union[str, Path, np.ndarray]) -> Tuple[np.ndarray, O
         if not path.is_file():
             raise FileNotFoundError(f"Input file not found: {path}")
         with rasterio.open(path) as src:
+            if src.count != 1:
+                raise ValueError(
+                    f"Expected a single-band metrics raster, "
+                    f"found {src.count} bands: {path}"
+                )
+
+            if src.width <= 0 or src.height <= 0:
+                raise ValueError(
+                    f"Invalid raster dimensions: {path}"
+                )
+
             arr = src.read(1)
+
+            if arr.shape != (src.height, src.width):
+                raise ValueError(
+                    f"Raster data and metadata dimensions "
+                    f"do not match: {path}"
+                )
             meta = {
                 "crs": src.crs,
                 "transform": src.transform,
@@ -60,87 +77,440 @@ def _load_input_raster(val: Union[str, Path, np.ndarray]) -> Tuple[np.ndarray, O
         raise TypeError(f"Expected str, Path, or numpy array, got {type(val)}")
 
 
-def verify_spatial_alignment(metas: List[Dict[str, Any]]):
-    """Verifies that all input rasters share identical CRS, transform, resolution, dimensions and bounds."""
-    if not metas:
-        return
-    ref = metas[0]
-    if ref is None:
-        return
-    for m in metas[1:]:
-        if m is None:
-            continue
-        # Compare CRS
-        if ref["crs"] != m["crs"]:
-            raise ValueError(f"CRS mismatch: {ref['crs']} vs {m['crs']}")
-        # Compare dimensions
-        if ref["width"] != m["width"] or ref["height"] != m["height"]:
-            raise ValueError(f"Dimension mismatch: {ref['width']}x{ref['height']} vs {m['width']}x{m['height']}")
-        # Compare transform
-        if not np.allclose(
-            [ref["transform"].a, ref["transform"].b, ref["transform"].c, ref["transform"].d, ref["transform"].e, ref["transform"].f],
-            [m["transform"].a, m["transform"].b, m["transform"].c, m["transform"].d, m["transform"].e, m["transform"].f],
-            atol=1e-5
-        ):
-            raise ValueError("Transform mismatch.")
-        # Compare resolution
-        if not np.allclose(ref["resolution"], m["resolution"], atol=1e-5):
-            raise ValueError("Resolution mismatch.")
-        # Compare bounds
-        if not np.allclose(
-            [ref["bounds"][0], ref["bounds"][1], ref["bounds"][2], ref["bounds"][3]],
-            [m["bounds"][0], m["bounds"][1], m["bounds"][2], m["bounds"][3]],
-            atol=1e-5
-        ):
-            raise ValueError("Bounds mismatch.")
+def verify_spatial_alignment(
+    metas: List[Dict[str, Any]],
+):
+    """Validate spatial metadata and raster grid alignment."""
 
+    from numbers import Integral
+    from rasterio.crs import CRS
 
-def filter_by_min_area(binary_map: np.ndarray, pixel_areas: np.ndarray, threshold_m2: float) -> np.ndarray:
-    """Filters out connected components (patches) whose total area is less than threshold_m2."""
-    if threshold_m2 <= 0:
-        return binary_map
-    
-    # 255 is NoData. We label components only where the value is 1.
-    label_mask = (binary_map == 1)
-    labeled, num_features = ndimage.label(label_mask)
-    if num_features == 0:
-        return binary_map
-        
-    filtered = binary_map.copy()
-    for i in range(1, num_features + 1):
-        comp_mask = (labeled == i)
-        comp_area = np.sum(pixel_areas[comp_mask])
-        if comp_area < threshold_m2:
-            filtered[comp_mask] = 0
-            
-    return filtered
+    if not isinstance(metas, (list, tuple)):
+        raise TypeError(
+            "Raster metadata must be a list or tuple."
+        )
 
+    validated = []
 
-def calculate_subset_stats(data: np.ndarray, mask: np.ndarray, percentiles: List[int] = [95]) -> Dict[str, Any]:
-    """Calculates summary statistics of data under mask. Returns None values if no pixels match."""
-    subset = data[mask]
-    if len(subset) == 0:
-        res = {
-            "mean": None,
-            "median": None,
-            "min": None,
-            "max": None,
-            "std": None
-        }
-        for p in percentiles:
-            res[f"p{p}"] = None
-        return res
-        
-    res = {
-        "mean": float(np.mean(subset)),
-        "median": float(np.median(subset)),
-        "min": float(np.min(subset)),
-        "max": float(np.max(subset)),
-        "std": float(np.std(subset))
+    required = {
+        "crs",
+        "width",
+        "height",
+        "transform",
+        "resolution",
+        "bounds",
     }
+
+    for index, meta in enumerate(metas):
+
+        if meta is None:
+            continue
+
+        if not isinstance(meta, dict):
+            raise TypeError(
+                f"Invalid raster metadata at index {index}."
+            )
+
+        missing = required - set(meta)
+
+        if missing:
+            raise ValueError(
+                f"Missing raster metadata: {sorted(missing)}"
+            )
+
+        for key in ("width", "height"):
+            value = meta[key]
+
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, Integral)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"Invalid raster dimension: {key}."
+                )
+
+        crs = meta["crs"]
+
+        if crs is not None:
+            try:
+                crs = CRS.from_user_input(crs)
+
+                if not crs:
+                    raise ValueError("Empty CRS.")
+
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid raster CRS at index {index}."
+                ) from exc
+
+        transform = meta["transform"]
+
+        try:
+            coefficients = np.array([
+                transform.a,
+                transform.b,
+                transform.c,
+                transform.d,
+                transform.e,
+                transform.f,
+            ], dtype=np.float64)
+
+        except Exception as exc:
+            raise ValueError(
+                "Invalid raster affine transform."
+            ) from exc
+
+        if not np.all(np.isfinite(coefficients)):
+            raise ValueError(
+                "Raster transform contains nonfinite values."
+            )
+
+        a, b, c, d, e, f = coefficients
+
+        determinant = a * e - b * d
+
+        if (
+            not np.isfinite(determinant)
+            or determinant == 0
+        ):
+            raise ValueError(
+                "Raster transform is singular or invalid."
+            )
+
+        resolution = np.asarray(
+            meta["resolution"],
+            dtype=np.float64,
+        )
+
+        if (
+            resolution.shape != (2,)
+            or not np.all(np.isfinite(resolution))
+            or np.any(resolution <= 0)
+        ):
+            raise ValueError(
+                "Invalid raster resolution."
+            )
+
+        expected_resolution = np.array([
+            np.hypot(a, d),
+            np.hypot(b, e),
+        ])
+
+        tolerance = float(
+            np.min(expected_resolution) * 1e-6
+        )
+
+        if not np.allclose(
+            resolution,
+            expected_resolution,
+            rtol=0,
+            atol=tolerance,
+        ):
+            raise ValueError(
+                "Resolution does not match affine transform."
+            )
+
+        bounds = np.asarray(
+            meta["bounds"],
+            dtype=np.float64,
+        )
+
+        if (
+            bounds.shape != (4,)
+            or not np.all(np.isfinite(bounds))
+            or bounds[0] >= bounds[2]
+            or bounds[1] >= bounds[3]
+        ):
+            raise ValueError(
+                "Invalid raster bounds."
+            )
+
+        width = meta["width"]
+        height = meta["height"]
+
+        corners = np.array([
+            [c, f],
+            [a * width + c, d * width + f],
+            [b * height + c, e * height + f],
+            [
+                a * width + b * height + c,
+                d * width + e * height + f,
+            ],
+        ])
+
+        expected_bounds = np.array([
+            corners[:, 0].min(),
+            corners[:, 1].min(),
+            corners[:, 0].max(),
+            corners[:, 1].max(),
+        ])
+
+        if not np.allclose(
+            bounds,
+            expected_bounds,
+            rtol=0,
+            atol=tolerance,
+        ):
+            raise ValueError(
+                "Bounds do not match raster geometry."
+            )
+
+        validated.append({
+            "crs": crs,
+            "width": width,
+            "height": height,
+            "transform": coefficients,
+            "resolution": resolution,
+            "bounds": bounds,
+            "tolerance": tolerance,
+        })
+
+    if not validated:
+        return
+
+    ref = validated[0]
+
+    for meta in validated[1:]:
+
+        if ref["crs"] != meta["crs"]:
+            raise ValueError("CRS mismatch.")
+
+        if (
+            ref["width"] != meta["width"]
+            or ref["height"] != meta["height"]
+        ):
+            raise ValueError("Dimension mismatch.")
+
+        tolerance = min(
+            ref["tolerance"],
+            meta["tolerance"],
+        )
+
+        for key in (
+            "transform",
+            "resolution",
+            "bounds",
+        ):
+            if not np.allclose(
+                ref[key],
+                meta[key],
+                rtol=0,
+                atol=tolerance,
+            ):
+                raise ValueError(
+                    f"{key.capitalize()} mismatch."
+                )
+
+
+
+def filter_by_min_area(
+    binary_map: np.ndarray,
+    pixel_areas: np.ndarray,
+    threshold_m2: float,
+) -> np.ndarray:
+    """Remove connected patches below the minimum physical area."""
+
+    from numbers import Real
+
+    if not isinstance(binary_map, np.ndarray):
+        raise TypeError("Binary map must be a numpy array.")
+
+    if binary_map.ndim != 2 or binary_map.size == 0:
+        raise ValueError(
+            "Binary map must be a nonempty 2D raster."
+        )
+
+    if binary_map.dtype.kind not in "biuf":
+        raise TypeError("Invalid binary map data type.")
+
+    if not np.all(
+        (binary_map == 0)
+        | (binary_map == 1)
+        | (binary_map == 255)
+    ):
+        raise ValueError("Invalid binary map values.")
+
+    if (
+        isinstance(threshold_m2, (bool, np.bool_))
+        or not isinstance(threshold_m2, Real)
+        or not np.isfinite(threshold_m2)
+        or threshold_m2 < 0
+    ):
+        raise ValueError("Invalid minimum area threshold.")
+
+    if threshold_m2 == 0:
+        return binary_map.copy()
+
+    if not isinstance(pixel_areas, np.ndarray):
+        raise TypeError("Pixel areas must be a numpy array.")
+
+    if pixel_areas.shape != binary_map.shape:
+        raise ValueError("Pixel area shape mismatch.")
+
+    if pixel_areas.dtype.kind not in "iuf":
+        raise TypeError("Invalid pixel area data type.")
+
+    if not np.all(np.isfinite(pixel_areas)):
+        raise ValueError("Pixel areas must be finite.")
+
+    if np.any(pixel_areas <= 0):
+        raise ValueError("Pixel areas must be positive.")
+
+    result = binary_map.copy()
+
+    foreground = binary_map == 1
+
+    if not np.any(foreground):
+        return result
+
+    labels, component_count = ndimage.label(foreground)
+
+    component_areas = np.bincount(
+        labels[foreground],
+        weights=pixel_areas[foreground].astype(
+            np.float64, copy=False
+        ),
+        minlength=component_count + 1,
+    )
+
+    if not np.all(np.isfinite(component_areas)):
+        raise ValueError(
+            "Connected component area overflow."
+        )
+
+    remove_component = component_areas < threshold_m2
+
+    # Label zero represents background.
+    remove_component[0] = False
+
+    removal_mask = remove_component[labels]
+
+    result[removal_mask] = 0
+
+    return result
+
+
+def calculate_subset_stats(
+    data: np.ndarray,
+    mask: np.ndarray,
+    percentiles: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Calculate finite statistics for a validated raster subset."""
+
+    from numbers import Integral
+
+    if percentiles is None:
+        percentiles = [95]
+
+    if not isinstance(data, np.ndarray):
+        raise TypeError("Statistics data must be a numpy array.")
+
+    if data.ndim != 2 or data.size == 0:
+        raise ValueError(
+            "Statistics data must be a nonempty 2D raster."
+        )
+
+    if data.dtype.kind not in "iuf":
+        raise TypeError(
+            "Statistics data must contain real numeric values."
+        )
+
+    if not isinstance(mask, np.ndarray):
+        raise TypeError("Statistics mask must be a numpy array.")
+
+    if mask.shape != data.shape:
+        raise ValueError(
+            "Statistics mask and raster shapes must match."
+        )
+
+    if mask.dtype.kind not in "biuf":
+        raise TypeError(
+            "Statistics mask must contain binary values."
+        )
+
+    if not np.all((mask == 0) | (mask == 1)):
+        raise ValueError(
+            "Statistics mask must contain only zero and one."
+        )
+
+    if not isinstance(percentiles, (list, tuple)):
+        raise TypeError(
+            "Percentiles must be supplied as a list or tuple."
+        )
+
+    validated_percentiles = []
+
     for p in percentiles:
-        res[f"p{p}"] = float(np.percentile(subset, p))
-    return res
+        if (
+            isinstance(p, (bool, np.bool_))
+            or not isinstance(p, Integral)
+            or not 0 <= p <= 100
+        ):
+            raise ValueError(
+                "Percentiles must be integers between 0 and 100."
+            )
+
+        p = int(p)
+
+        if p in validated_percentiles:
+            raise ValueError(
+                "Duplicate percentiles are not permitted."
+            )
+
+        validated_percentiles.append(p)
+
+    subset = data[mask.astype(bool, copy=False)]
+
+    result = {
+        "mean": None,
+        "median": None,
+        "min": None,
+        "max": None,
+        "std": None,
+    }
+
+    for p in validated_percentiles:
+        result[f"p{p}"] = None
+
+    if subset.size == 0:
+        return result
+
+    if not np.all(np.isfinite(subset)):
+        raise ValueError(
+            "Statistics subset contains NaN or infinite values."
+        )
+
+    subset = subset.astype(np.float64, copy=False)
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        result.update({
+            "mean": float(np.mean(subset)),
+            "median": float(np.median(subset)),
+            "min": float(np.min(subset)),
+            "max": float(np.max(subset)),
+            "std": float(np.std(subset)),
+        })
+
+        if validated_percentiles:
+            values = np.percentile(
+                subset,
+                validated_percentiles,
+            )
+
+            for p, value in zip(
+                validated_percentiles, values
+            ):
+                result[f"p{p}"] = float(value)
+
+    for key, value in result.items():
+        if not np.isfinite(value):
+            raise ValueError(
+                f"Calculated statistic {key} is not finite."
+            )
+
+    return result
+
 
 
 def calculate_metrics(
@@ -189,6 +559,261 @@ def calculate_metrics(
         valid_mask_arr.shape != shape):
         raise ValueError("Geometry mismatch: Array shapes are not identical.")
 
+    # NORMALIZE DECLARED RASTER NODATA
+
+    def normalize_nodata(array, metadata, categorical):
+
+        if metadata is None:
+            return array
+
+        nodata = metadata.get("nodata")
+
+        if nodata is None:
+            return array
+
+        if np.isnan(nodata):
+            missing = np.isnan(array)
+        else:
+            missing = array == nodata
+
+        if not np.any(missing):
+            return array
+
+        if categorical:
+
+            if array.dtype.kind not in "biuf":
+                raise TypeError(
+                    "Invalid categorical raster data type."
+                )
+
+            if array.dtype.kind == "f":
+                normalized = array.copy()
+            elif array.dtype.kind == "b" or (
+                np.iinfo(array.dtype).max < 255
+            ):
+                normalized = array.astype(np.int64)
+            else:
+                normalized = array.copy()
+
+            normalized[missing] = 255
+
+        else:
+
+            normalized = array.astype(
+                np.float64, copy=True
+            )
+
+            normalized[missing] = np.nan
+
+        return normalized
+
+    trans_arr = normalize_nodata(
+        trans_arr, trans_meta, True
+    )
+
+    cva_arr = normalize_nodata(
+        cva_arr, cva_meta, False
+    )
+
+    ndvi_arr = normalize_nodata(
+        ndvi_arr, ndvi_meta, False
+    )
+
+    gndvi_arr = normalize_nodata(
+        gndvi_arr, gndvi_meta, False
+    )
+
+    ndre_arr = normalize_nodata(
+        ndre_arr, ndre_meta, False
+    )
+
+    deg_arr = normalize_nodata(
+        deg_arr, deg_meta, True
+    )
+
+    rec_arr = normalize_nodata(
+        rec_arr, rec_meta, True
+    )
+
+    res_arr = normalize_nodata(
+        res_arr, res_meta, True
+    )
+
+    canopy_arr = normalize_nodata(
+        canopy_arr, canopy_meta, True
+    )
+
+    wetland_arr = normalize_nodata(
+        wetland_arr, wetland_meta, True
+    )
+
+    valid_mask_arr = normalize_nodata(
+        valid_mask_arr, valid_mask_meta, True
+    )
+
+    # STRICT METRICS INPUT VALIDATION
+
+    from numbers import Real, Integral
+
+    if not isinstance(config, dict):
+        raise TypeError("Metrics configuration must be a dictionary.")
+
+    raster_inputs = {
+        "transition": trans_arr,
+        "cva": cva_arr,
+        "delta_ndvi": ndvi_arr,
+        "delta_gndvi": gndvi_arr,
+        "delta_ndre": ndre_arr,
+        "degradation": deg_arr,
+        "recovery": rec_arr,
+        "residual_stress": res_arr,
+        "canopy_loss": canopy_arr,
+        "wetland": wetland_arr,
+        "valid_analysis": valid_mask_arr,
+    }
+
+    for name, array in raster_inputs.items():
+
+        if array.ndim != 2 or array.size == 0:
+            raise ValueError(
+                f"{name}: expected a nonempty 2D raster."
+            )
+
+        if array.dtype.kind not in "biuf":
+            raise TypeError(
+                f"{name}: invalid raster data type."
+            )
+
+    if trans_arr.dtype.kind not in "iu":
+        raise TypeError(
+            "Transition raster must contain integer class IDs."
+        )
+
+    if not np.all(
+        ((trans_arr >= 0) & (trans_arr <= 15))
+        | (trans_arr == 255)
+    ):
+        raise ValueError(
+            "Transition raster contains invalid class IDs."
+        )
+
+    categorical_masks = {
+        "degradation": deg_arr,
+        "recovery": rec_arr,
+        "residual_stress": res_arr,
+        "canopy_loss": canopy_arr,
+        "wetland": wetland_arr,
+        "valid_analysis": valid_mask_arr,
+    }
+
+    for name, array in categorical_masks.items():
+
+        if not np.all(
+            (array == 0)
+            | (array == 1)
+            | (array == 255)
+        ):
+            raise ValueError(
+                f"{name}: invalid categorical mask values."
+            )
+
+    selected = (
+        (valid_mask_arr == 1)
+        & (wetland_arr == 1)
+    )
+
+    continuous_rasters = {
+        "cva": cva_arr,
+        "delta_ndvi": ndvi_arr,
+        "delta_gndvi": gndvi_arr,
+        "delta_ndre": ndre_arr,
+    }
+
+    for name, array in continuous_rasters.items():
+
+        if array.dtype.kind not in "iuf":
+            raise TypeError(
+                f"{name}: expected real numeric raster values."
+            )
+
+        if np.any(np.isinf(array[selected])):
+            raise ValueError(
+                f"{name}: infinite values inside analysis area."
+            )
+
+    valid_cva = selected & np.isfinite(cva_arr)
+    valid_cva &= cva_arr != -9999.0
+
+    if np.any(cva_arr[valid_cva] < 0):
+        raise ValueError(
+            "CVA magnitude cannot be negative."
+        )
+
+    checked_metrics = config.get("metrics", {})
+
+    if not isinstance(checked_metrics, dict):
+        raise TypeError(
+            "Metrics settings must be a dictionary."
+        )
+
+    checked_weights = checked_metrics.get(
+        "severity_weights", {}
+    )
+
+    if not isinstance(checked_weights, dict):
+        raise TypeError(
+            "Severity weights must be a dictionary."
+        )
+
+    for name, value in checked_weights.items():
+
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, Real)
+            or not np.isfinite(value)
+            or not 0 <= value <= 1
+        ):
+            raise ValueError(
+                f"Invalid severity weight: {name}."
+            )
+
+    include_canopy = checked_metrics.get(
+        "include_canopy_loss_in_swd", False
+    )
+
+    if not isinstance(include_canopy, bool):
+        raise TypeError(
+            "Canopy loss inclusion must be boolean."
+        )
+
+    checked_mmu = checked_metrics.get(
+        "minimum_change_area", {}
+    )
+
+    if not isinstance(checked_mmu, dict):
+        raise TypeError(
+            "Minimum change area settings must be a dictionary."
+        )
+
+    if not isinstance(
+        checked_mmu.get("enabled", False), bool
+    ):
+        raise TypeError(
+            "Minimum change area enabled must be boolean."
+        )
+
+    threshold = checked_mmu.get("value_m2", 0)
+
+    if (
+        isinstance(threshold, (bool, np.bool_))
+        or not isinstance(threshold, Real)
+        or not np.isfinite(threshold)
+        or threshold < 0
+    ):
+        raise ValueError(
+            "Invalid minimum change area threshold."
+        )
+
     # 3. Resolve spatial grid parameters for area calculation
     crs = None
     transform = None
@@ -210,6 +835,140 @@ def calculate_metrics(
     else:
         raise ValueError("Missing spatial grid reference. Provide file paths or a reference_grid object.")
 
+    # STRICT REFERENCE GRID RECONCILIATION
+
+    if reference_grid is not None:
+
+        required_attributes = (
+            "crs",
+            "transform",
+            "width",
+            "height",
+        )
+
+        for attribute in required_attributes:
+
+            if not hasattr(reference_grid, attribute):
+                raise ValueError(
+                    f"Reference grid missing {attribute}."
+                )
+
+        grid_width = reference_grid.width
+        grid_height = reference_grid.height
+
+        for name, dimension in (
+            ("width", grid_width),
+            ("height", grid_height),
+        ):
+
+            if (
+                isinstance(dimension, (bool, np.bool_))
+                or not isinstance(dimension, Integral)
+                or dimension <= 0
+            ):
+                raise ValueError(
+                    f"Invalid supplied reference grid {name}."
+                )
+
+        if (grid_height, grid_width) != shape:
+            raise ValueError(
+                "Supplied reference grid shape mismatch."
+            )
+
+        grid_transform = reference_grid.transform
+
+        if grid_transform is not None:
+
+            try:
+                coefficients = np.asarray(
+                    [
+                        grid_transform.a,
+                        grid_transform.b,
+                        grid_transform.c,
+                        grid_transform.d,
+                        grid_transform.e,
+                        grid_transform.f,
+                    ],
+                    dtype=np.float64,
+                )
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError(
+                    "Invalid supplied reference grid transform."
+                )
+
+            if not np.all(np.isfinite(coefficients)):
+                raise ValueError(
+                    "Nonfinite reference grid transform."
+                )
+
+            a, b, c, d, e, f = coefficients
+
+            determinant = a * e - b * d
+
+            if (
+                not np.isfinite(determinant)
+                or determinant == 0
+            ):
+                raise ValueError(
+                    "Singular reference grid transform."
+                )
+
+            corners = [
+                grid_transform @ (0, 0),
+                grid_transform @ (grid_width, 0),
+                grid_transform @ (0, grid_height),
+                grid_transform @ (grid_width, grid_height),
+            ]
+
+            xs, ys = zip(*corners)
+
+            grid_metadata = {
+                "crs": reference_grid.crs,
+                "transform": grid_transform,
+                "width": grid_width,
+                "height": grid_height,
+                "resolution": (
+                    np.hypot(a, d),
+                    np.hypot(b, e),
+                ),
+                "bounds": (
+                    min(xs),
+                    min(ys),
+                    max(xs),
+                    max(ys),
+                ),
+            }
+
+            verify_spatial_alignment(
+                non_null_metas + [grid_metadata]
+            )
+
+        elif non_null_metas:
+            raise ValueError(
+                "Supplied reference grid has no transform "
+                "but raster spatial metadata is available."
+            )
+
+    # Reconcile grid dimensions with actual raster dimensions.
+
+    for name, dimension in (
+        ("width", width),
+        ("height", height),
+    ):
+        if (
+            isinstance(dimension, (bool, np.bool_))
+            or not isinstance(dimension, Integral)
+            or dimension <= 0
+        ):
+            raise ValueError(
+                f"Invalid reference grid {name}."
+            )
+
+    if (height, width) != shape:
+        raise ValueError(
+            "Reference grid dimensions do not match raster shape."
+        )
+
     # Calculate physical pixel areas only when authoritative spatial
     # reference information is available. CRS-less/pixel-space rasters
     # must never be interpreted as metres.
@@ -220,39 +979,84 @@ def calculate_metrics(
         pixel_areas = None
         physical_area_available = False
 
-    # 4. Connected Component Filtering (MMU)
+    # 4. Define strictly valid population (exclude NoData)
+
+    valid_pop = (
+        (valid_mask_arr == 1)
+        & (wetland_arr == 1)
+        & (trans_arr != 255)
+        & np.isfinite(cva_arr)
+        & np.isfinite(ndvi_arr)
+        & np.isfinite(gndvi_arr)
+        & np.isfinite(ndre_arr)
+        & (cva_arr != -9999.0)
+        & (ndvi_arr != -9999.0)
+        & (gndvi_arr != -9999.0)
+        & (ndre_arr != -9999.0)
+        & (deg_arr != 255)
+        & (rec_arr != 255)
+        & (res_arr != 255)
+        & (canopy_arr != 255)
+    )
+
+    # 5. Connected Component Filtering (MMU)
+
     metrics_config = config.get("metrics", {})
-    min_change_config = metrics_config.get("minimum_change_area", {})
-    mmu_enabled = min_change_config.get("enabled", False)
-    mmu_val_m2 = min_change_config.get("value_m2", 0)
+
+    min_change_config = metrics_config.get(
+        "minimum_change_area", {}
+    )
+
+    mmu_enabled = min_change_config.get(
+        "enabled", False
+    )
+
+    mmu_val_m2 = min_change_config.get(
+        "value_m2", 0
+    )
 
     minimum_change_area_applied = False
     minimum_change_area_available = True
+
     if mmu_enabled and mmu_val_m2 > 0:
+
         if physical_area_available:
-            deg_arr = filter_by_min_area(deg_arr, pixel_areas, mmu_val_m2)
-            rec_arr = filter_by_min_area(rec_arr, pixel_areas, mmu_val_m2)
-            res_arr = filter_by_min_area(res_arr, pixel_areas, mmu_val_m2)
-            canopy_arr = filter_by_min_area(canopy_arr, pixel_areas, mmu_val_m2)
+
+            def filter_valid_patches(array):
+
+                # Prevent excluded pixels from connecting
+                # independent patches or contributing area.
+
+                restricted = np.where(
+                    valid_pop,
+                    array,
+                    0,
+                )
+
+                filtered = filter_by_min_area(
+                    restricted,
+                    pixel_areas,
+                    mmu_val_m2,
+                )
+
+                # Preserve original values outside the
+                # analysis population, including NoData.
+
+                return np.where(
+                    valid_pop,
+                    filtered,
+                    array,
+                )
+
+            deg_arr = filter_valid_patches(deg_arr)
+            rec_arr = filter_valid_patches(rec_arr)
+            res_arr = filter_valid_patches(res_arr)
+            canopy_arr = filter_valid_patches(canopy_arr)
+
             minimum_change_area_applied = True
+
         else:
             minimum_change_area_available = False
-
-    # 5. Define strictly valid population (exclude NoData)
-    # Define invalid/NoData pixels
-    invalid_mask = (
-        (valid_mask_arr == 0) |
-        (trans_arr == 255) |
-        (cva_arr == -9999.0) | np.isnan(cva_arr) |
-        (ndvi_arr == -9999.0) | np.isnan(ndvi_arr) |
-        (gndvi_arr == -9999.0) | np.isnan(gndvi_arr) |
-        (ndre_arr == -9999.0) | np.isnan(ndre_arr) |
-        (deg_arr == 255) |
-        (rec_arr == 255) |
-        (res_arr == 255) |
-        (canopy_arr == 255)
-    )
-    valid_pop = ~invalid_mask
 
     # 6. Baseline Area (A_baseline)
     baseline_pixel_count = int(np.sum(valid_pop))
@@ -620,6 +1424,7 @@ def calculate_metrics(
         }
 
     # 17. Wetland Extent Metrics
+
     wetland_extent_status = "NOT_AVAILABLE"
     wetland_extent_T1 = None
     wetland_extent_T2 = None
@@ -627,40 +1432,15 @@ def calculate_metrics(
     wetland_extent_change_ha = None
     physical_wetland_depletion = "NOT_AVAILABLE"
 
-    # Read Phase 7 physical depletion flags and configurations
-    depletion_enabled_config = config.get("wetland", {}).get("depletion_claims", {}).get("enabled", False)
-    # Check if config provides paths to temporal wetland extent
-    temporal_config = metrics_config.get("temporal_wetland_extent", {})
-    t1_path = temporal_config.get("t1_path")
-    t2_path = temporal_config.get("t2_path")
+    # Physical depletion requires independently verified
+    # temporal wetland evidence. Configuration and raster
+    # paths alone do not establish scientific validity.
 
-    if depletion_enabled_config and t1_path and t2_path:
-        t1_ext_arr, t1_ext_meta = _load_input_raster(t1_path)
-        t2_ext_arr, t2_ext_meta = _load_input_raster(t2_path)
-
-        if t1_ext_arr.shape != shape or t2_ext_arr.shape != shape:
-            raise ValueError("Temporal wetland extent raster shape mismatch.")
-
-        t1_ext_mask = (t1_ext_arr == 1) & valid_pop
-        t2_ext_mask = (t2_ext_arr == 1) & valid_pop
-
-        if physical_area_available:
-            wetland_extent_T1 = float(np.sum(pixel_areas[t1_ext_mask]))
-            wetland_extent_T2 = float(np.sum(pixel_areas[t2_ext_mask]))
-            wetland_extent_change = wetland_extent_T2 - wetland_extent_T1
-            wetland_extent_change_ha = wetland_extent_change / 10000.0
-            wetland_extent_status = "AVAILABLE"
-
-            depletion_mask = (t1_ext_arr == 1) & (t2_ext_arr == 0) & valid_pop
-            physical_wetland_depletion = float(np.sum(pixel_areas[depletion_mask])) / 10000.0
-        else:
-            wetland_extent_status = "PIXEL_ONLY"
-            warnings_list.append(
-                "Temporal wetland extent is available in pixel space, but "
-                "physical hectares cannot be calculated without a spatial CRS."
-            )
-    else:
-        warnings_list.append("Wetland-specific physical depletion cannot be quantified.")
+    warnings_list.append(
+        "Wetland-specific physical depletion cannot be "
+        "quantified without independently verified "
+        "temporal wetland extent evidence."
+    )
 
     # 18. Build result and metadata
     metadata = {

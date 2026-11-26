@@ -16,11 +16,20 @@ from ..services import RunWorker
 router = APIRouter(prefix="/api/runs/{run_id}/report", tags=["Reports"])
 
 
-def _resolve_run_dir(run_id: str) -> Path:
+def _resolve_run_dir(
+    run_id: str,
+    project_id: str | None = None,
+) -> Path:
     """Return the run output directory, raising 404 if the run is unknown."""
-    run_info = RunWorker.get_run_status(run_id)
+    run_info = RunWorker.get_run_status(run_id, project_id=project_id)
     if not run_info:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    if run_info.get("status") != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail="Report unavailable for an incomplete or failed run.",
+        )
+
     out_dir = Path(run_info["output_directory"])
     if (out_dir / run_id).is_dir():
         out_dir = out_dir / run_id
@@ -69,12 +78,12 @@ def _find_technical_pdf(out_dir: Path) -> Path:
 
 
 @router.get("/pdf", summary="Download the client-facing summary PDF report")
-def get_pdf_report(run_id: str):
+def get_pdf_report(run_id: str, project_id: str | None = None):
     """
     Returns the simple (executive summary) PDF for the given run.
     Works for both VEGETATION and WETLAND analysis modes.
     """
-    out_dir = _resolve_run_dir(run_id)
+    out_dir = _resolve_run_dir(run_id, project_id=project_id)
     pdf_path = _find_simple_pdf(out_dir)
 
     if not pdf_path.exists():
@@ -95,12 +104,12 @@ def get_pdf_report(run_id: str):
 
 
 @router.get("/pdf/technical", summary="Download the full scientific/technical PDF report")
-def get_technical_pdf_report(run_id: str):
+def get_technical_pdf_report(run_id: str, project_id: str | None = None):
     """
     Returns the technical (full scientific audit) PDF for the given run.
     Works for both VEGETATION and WETLAND analysis modes.
     """
-    out_dir = _resolve_run_dir(run_id)
+    out_dir = _resolve_run_dir(run_id, project_id=project_id)
     pdf_path = _find_technical_pdf(out_dir)
 
     if not pdf_path.exists():
