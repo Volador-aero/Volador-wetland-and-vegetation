@@ -1,4 +1,4 @@
-"""
+﻿"""
 backend/app/main.py
 ===================
 FastAPI Application Entry Point for the GIS Wetland Engine backend.
@@ -18,7 +18,7 @@ if str(BACKEND_DIR) not in sys.path:
 if str(ENGINE_SRC) not in sys.path:
     sys.path.insert(0, str(ENGINE_SRC))
 
-from app.routers import projects, datasets, runs, results, layers, reports
+from app.routers import projects, datasets, runs, results, layers, reports, assistant
 from app.schemas import APIErrorResponse, ErrorDetail
 
 app = FastAPI(
@@ -43,6 +43,7 @@ app.include_router(runs.router)
 app.include_router(results.router)
 app.include_router(layers.router)
 app.include_router(reports.router)
+app.include_router(assistant.router)
 
 
 @app.get("/api/health", tags=["Health"])

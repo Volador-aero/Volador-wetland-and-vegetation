@@ -27,18 +27,27 @@ def upload_dataset_band(
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
-    proj_dir = Path(project["t1_dir"]).parent
+    if band not in {"green", "red", "rededge", "nir", "boundary"}:
+        raise HTTPException(status_code=400, detail="Unsupported dataset band")
+    if band != "boundary" and time_point not in {"t1", "t2"}:
+        raise HTTPException(status_code=400, detail="time_point must be 't1' or 't2'")
+
+    proj_dir = ProjectStore.project_directory(project_id)
 
     if band == "boundary":
         dest_dir = proj_dir
-        filename = f"wetland_boundary_{file.filename}"
+        safe_name = Path(file.filename or "boundary.geojson").name
+        filename = f"wetland_boundary_{safe_name}"
     else:
-        dest_dir = proj_dir / time_point
+        dest_dir = ProjectStore.dataset_directory(project_id, time_point)
         dest_dir.mkdir(parents=True, exist_ok=True)
         suffix = {"green": "G", "red": "R", "rededge": "RE", "nir": "NIR"}.get(band, band.upper())
         filename = f"scene_{suffix}.tif"
 
-    target_path = dest_dir / filename
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target_path = (dest_dir / filename).resolve()
+    if not target_path.is_relative_to(proj_dir.resolve()):
+        raise HTTPException(status_code=400, detail="Invalid upload destination")
     with open(target_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -89,8 +98,8 @@ def validate_project_datasets(
 
     is_veg = (effective_mode == "vegetation")
 
-    t1_dir = Path(project["t1_dir"])
-    t2_dir = Path(project["t2_dir"])
+    t1_dir = ProjectStore.dataset_directory(project_id, "t1")
+    t2_dir = ProjectStore.dataset_directory(project_id, "t2")
     wetland_boundary = project.get("wetland_boundary")
 
     sample_dir = ENGINE_SRC.parent / "data" / "sample_scene"

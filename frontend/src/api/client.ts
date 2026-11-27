@@ -3,7 +3,11 @@
  * TypeScript API client for communicating with the FastAPI backend server.
  */
 
-const API_BASE = "http://127.0.0.1:8000/api";
+const configuredApiBase = import.meta.env.VITE_API_BASE_URL?.trim();
+
+const API_BASE = (
+  configuredApiBase || "http://127.0.0.1:8000/api"
+).replace(/\/+$/, "");
 
 export interface Project {
   id: string;
@@ -273,28 +277,46 @@ export interface AnalysisResults {
   errors: string[];
   metadata: Record<string, any>;
 }
-async function handleResponseError(res: Response, defaultMessage: string): Promise<never> {
+
+async function handleResponseError(
+  res: Response,
+  defaultMessage: string
+): Promise<never> {
   let detailMessage = defaultMessage;
+
   try {
-    const data = await res.json();
-    if (data?.detail) {
-      detailMessage = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
-    } else if (data?.error?.message) {
+    const data = await res.clone().json();
+
+    if (typeof data?.detail === "string") {
+      detailMessage = data.detail;
+    } else if (Array.isArray(data?.detail)) {
+      const validationMessages = data.detail
+        .map((item: { loc?: unknown[]; msg?: string }) => {
+          const location = Array.isArray(item.loc)
+            ? item.loc.filter(
+                (part) => part !== "body"
+              ).join(".")
+            : "";
+
+          const message = item.msg || "Invalid value";
+
+          return location
+            ? `${location}: ${message}`
+            : message;
+        })
+        .filter(Boolean);
+
+      if (validationMessages.length > 0) {
+        detailMessage = validationMessages.join("; ");
+      }
+    } else if (typeof data?.error?.message === "string") {
       detailMessage = data.error.message;
     }
   } catch {
-    // Keep default message if response body is not JSON
+    // Keep the default message for empty or non-JSON responses.
   }
-  throw new Error(detailMessage);
-}
 
-export async function fetchHealth(): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/health`);
-    return res.ok;
-  } catch {
-    return false;
-  }
+  throw new Error(detailMessage);
 }
 
 export async function createProject(name: string, description?: string): Promise<Project> {
@@ -482,3 +504,77 @@ export function getDatasetPreviewImageUrl(projectId: string, timePoint: string =
   return `${API_BASE}/projects/${projectId}/datasets/preview-image?time_point=${timePoint}`;
 }
 
+
+// ------------------------------------------------------------
+// AETHRA AI Assistant API
+// ------------------------------------------------------------
+
+
+
+
+export interface AssistantChatResponse {
+  answer: string;
+  model: string;
+  status: string;
+}
+
+export interface AssistantChatOptions {
+  projectId?: string;
+  runId?: string;
+}
+
+
+export async function sendAssistantMessage(
+  question: string,
+  options?: AssistantChatOptions
+): Promise<AssistantChatResponse> {
+  let res: Response;
+
+  try {
+    res = await fetch(`${API_BASE}/assistant/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        question,
+        project_id: options?.projectId,
+        run_id: options?.runId,
+      }),
+    });
+  } catch {
+    throw new Error(
+      "Unable to connect to the AI Assistant. Please check your internet connection and make sure the backend server is running."
+    );
+  }
+
+  if (!res.ok) {
+    await handleResponseError(
+      res,
+      "Failed to get a response from the AI Assistant."
+    );
+  }
+
+  return res.json();
+}
+
+
+export interface AssistantStatusResponse {
+  status: "READY" | "NOT_CONFIGURED";
+  configured: boolean;
+  model: string | null;
+  message: string;
+}
+
+export async function getAssistantStatus(): Promise<AssistantStatusResponse> {
+  const res = await fetch(`${API_BASE}/assistant/status`);
+
+  if (!res.ok) {
+    await handleResponseError(
+      res,
+      "Unable to check AI Assistant status."
+    );
+  }
+
+  return res.json();
+}
