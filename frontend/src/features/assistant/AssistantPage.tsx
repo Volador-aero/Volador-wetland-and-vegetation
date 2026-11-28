@@ -49,7 +49,15 @@ const remarkPreserveLineBreaks = () => (tree: any) => {
 
   visit(tree);
 };
-
+const normalizeMathDelimiters = (content: string): string => {
+  return content
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_, formula) => `$$\n${formula}\n$$`)
+    .replace(/\\\(([\s\S]*?)\\\)/g, (_, formula) => `$${formula}$`)
+    .replace(
+      /^(\s*NDVI\s*=\s*\(NIR\s*-\s*Red\)\s*\/\s*\(NIR\s*\+\s*Red\)\s*)$/gim,
+      (_, formula) => `$$\n${formula.trim()}\n$$`
+    );
+};
 const markdownComponents: Components = {
   table({ children }) {
     return (
@@ -266,13 +274,13 @@ export default function AssistantPage() {
               >
                 {message.role === "assistant" ? (
                   <div className="markdown-content">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm, remarkMath, remarkPreserveLineBreaks]}
-                      rehypePlugins={[rehypeKatex]}
-                      components={markdownComponents}
-                    >
-                      {message.content}
-                    </ReactMarkdown>
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm, remarkMath, remarkPreserveLineBreaks]}
+                        rehypePlugins={[rehypeKatex]}
+                        components={markdownComponents}
+                      >
+                        {normalizeMathDelimiters(message.content)}
+                      </ReactMarkdown>
                   </div>
                 ) : (
                   <div className="whitespace-pre-wrap break-words">{message.content}</div>
