@@ -1,0 +1,28 @@
+# Backend API
+fastapi
+uvicorn
+python-multipart
+pydantic
+httpx
+
+# GIS and scientific processing
+numpy
+rasterio
+scipy
+affine
+pyshp
+matplotlib
+Pillow
+
+# ONNX model generation and inference
+onnx
+onnxruntime
+
+# Raster fusion and PDF/report validation
+opencv-python-headless
+reportlab
+pypdf
+
+# Testing
+pytest
+pytest-cov

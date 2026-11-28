@@ -150,6 +150,7 @@ const mockContextValue: ProjectContextType = {
   clearAll: vi.fn().mockResolvedValue(undefined),
   setActiveLayerId: vi.fn(),
   triggerValidation: vi.fn().mockResolvedValue(undefined),
+  updateDates: vi.fn().mockResolvedValue(undefined),
   uploadBand: vi.fn().mockResolvedValue(undefined),
   triggerRun: vi.fn().mockResolvedValue(undefined),
   refreshResults: vi.fn().mockResolvedValue(undefined),

@@ -1,0 +1,156 @@
+{
+    "pair_name": "2026-11-01_2026-11-25",
+    "t1_source": "D:\\Volador Tasks\\Day_5\\Volador-wetland-and-vegetation\\backend\\storage\\projects\\prj_1795582750102\\runs\\run_20261125_051815_591d2a286dea4c85921765f6e6e78e01\\alignment\\t1_aligned",
+    "t2_source": "D:\\Volador Tasks\\Day_5\\Volador-wetland-and-vegetation\\backend\\storage\\projects\\prj_1795582750102\\runs\\run_20261125_051815_591d2a286dea4c85921765f6e6e78e01\\alignment\\t2_aligned",
+    "feature_vector": [
+        "NDVI",
+        "GNDVI",
+        "NDRE"
+    ],
+    "delta_definition": "T2 - T1 (increase is positive, decrease is negative)",
+    "cva_formula": "sqrt(delta_ndvi^2 + delta_gndvi^2 + delta_ndre^2)",
+    "standardization": {
+        "method": "z-score divide by index standard deviation",
+        "scales": {
+            "std_ndvi": 0.0,
+            "std_gndvi": 0.0,
+            "std_ndre": 0.0
+        }
+    },
+    "mathematical_reconciliation": {
+        "max_absolute_error_cva_squared": 0.0,
+        "mean_absolute_error_cva_squared": 0.0
+    },
+    "spatial_metadata": {
+        "crs": "EPSG:32633",
+        "transform": [
+            10.0,
+            0.0,
+            500000.0,
+            0.0,
+            -10.0,
+            5000000.0
+        ],
+        "width": 100,
+        "height": 100,
+        "resolution": [
+            10.0,
+            10.0
+        ],
+        "bounds": [
+            500000.0,
+            4999000.0,
+            501000.0,
+            5000000.0
+        ]
+    },
+    "overlap_information": {
+        "valid_pixel_count": 10000,
+        "nodata_pixel_count": 0,
+        "nodata_value": -9999.0
+    },
+    "statistics": {
+        "delta_ndvi": {
+            "count": 10000,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0,
+            "pct_positive": 0.0,
+            "pct_negative": 0.0,
+            "pct_zero": 100.0
+        },
+        "delta_gndvi": {
+            "count": 10000,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0,
+            "pct_positive": 0.0,
+            "pct_negative": 0.0,
+            "pct_zero": 100.0
+        },
+        "delta_ndre": {
+            "count": 10000,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0,
+            "pct_positive": 0.0,
+            "pct_negative": 0.0,
+            "pct_zero": 100.0
+        },
+        "cva_magnitude": {
+            "count": 10000,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0
+        },
+        "cva_standardized": {
+            "count": 10000,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0
+        }
+    },
+    "software_version": "1.0.0",
+    "transition_map_statistics": {
+        "DEGRADATION": {
+            "pixel_count": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0
+        },
+        "RECOVERY": {
+            "pixel_count": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0
+        },
+        "VEGETATION_TO_BACKGROUND": {
+            "pixel_count": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0
+        },
+        "BACKGROUND_TO_VEGETATION": {
+            "pixel_count": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0
+        },
+        "STABLE": {
+            "pixel_count": 10000,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0
+        }
+    }
+}

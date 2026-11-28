@@ -1,0 +1,12 @@
+[INFO] [run_20261123_035907] gis_engine.pipeline — Phase 13 — Production pipeline START. run_id=run_20261123_035907
+[INFO] [run_20261123_035907] gis_engine.pipeline — Step 1 — Loading configuration: D:\Volador Tasks\Day_5\Volador-wetland-and-vegetation\backend\storage\projects\prj_1795168891360\runs\.run_20261123_035907_run_config.json
+[INFO] [run_20261123_035907] gis_engine.pipeline — Analysis mode: wetland
+[INFO] [run_20261123_035907] gis_engine.pipeline — Step 1 — Configuration loaded. hash=6cbfa2a121880fe0…
+[INFO] [run_20261123_035907] gis_engine.pipeline — Step 2 — Validating inputs
+[INFO] [run_20261123_035907] gis_engine.pipeline — Step 2 — Wetland inputs valid. T1=2026-11-01 T2=2026-11-20 interval=19 days
+[INFO] [run_20261123_035907] gis_engine.pipeline — Step 3 — Spatial/temporal alignment
+[WARNING] [run_20261123_035907] gis_engine.alignment.temporal — Band 'green' at D:\Volador Tasks\Day_5\Volador-wetland-and-vegetation\backend\storage\projects\prj_1795168891360\datasets\t2\scene_G.tif has no CRS. Processing in pixel-coordinate space (require_crs=False). Ensure all bands share the same pixel grid.
+[WARNING] [run_20261123_035907] gis_engine.alignment.temporal — Band 'red' at D:\Volador Tasks\Day_5\Volador-wetland-and-vegetation\backend\storage\projects\prj_1795168891360\datasets\t2\scene_R.tif has no CRS. Processing in pixel-coordinate space (require_crs=False). Ensure all bands share the same pixel grid.
+[WARNING] [run_20261123_035907] gis_engine.alignment.temporal — Band 'rededge' at D:\Volador Tasks\Day_5\Volador-wetland-and-vegetation\backend\storage\projects\prj_1795168891360\datasets\t2\scene_RE.tif has no CRS. Processing in pixel-coordinate space (require_crs=False). Ensure all bands share the same pixel grid.
+[WARNING] [run_20261123_035907] gis_engine.alignment.temporal — Band 'nir' at D:\Volador Tasks\Day_5\Volador-wetland-and-vegetation\backend\storage\projects\prj_1795168891360\datasets\t2\scene_NIR.tif has no CRS. Processing in pixel-coordinate space (require_crs=False). Ensure all bands share the same pixel grid.
+[ERROR] [run_20261123_035907] gis_engine.pipeline — Phase 13 — Pipeline FAILED: Alignment failed: CRS mismatch: one grid has CRS defined while the other does not.

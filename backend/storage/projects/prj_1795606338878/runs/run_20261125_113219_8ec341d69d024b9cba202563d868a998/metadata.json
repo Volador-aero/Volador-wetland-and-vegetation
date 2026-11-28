@@ -1,0 +1,37 @@
+{
+    "run_id": "run_20261125_113219_8ec341d69d024b9cba202563d868a998",
+    "software_version": "1.0.0",
+    "analysis_mode": "wetland",
+    "git_commit": "bcabe210ba4f3f045d62a913ea470b85b90eae0e",
+    "execution_timestamp_utc": "2026-11-25T11:33:22.530439+00:00",
+    "python_version": "3.13.7 (tags/v3.13.7:bcee1c3, Aug 14 2025, 14:15:11) [MSC v.1944 64 bit (AMD64)]",
+    "os": "Windows-11-10.0.26200-SP0",
+    "model_path": "D:\\Volador Tasks\\Day_5\\Volador-wetland-and-vegetation\\backend\\Engine_module\\models\\best_finetuned_model.onnx",
+    "model_sha256": "27c1e54b561367c2c21e852aab7ca1eb130494a4eb15ab929032654ac6c467c9",
+    "configuration_hash": "40863153dc9d67d5d9367f404c9fafcb425804a69bf067ff025301375a0db120",
+    "config_snapshot": "D:\\Volador Tasks\\Day_5\\Volador-wetland-and-vegetation\\backend\\storage\\projects\\prj_1795606338878\\runs\\run_20261125_113219_8ec341d69d024b9cba202563d868a998\\config_used.json",
+    "input_t1": {
+        "path": "D:\\Volador Tasks\\Day_5\\Volador-wetland-and-vegetation\\backend\\Engine_module\\data\\sample_scene\\t1",
+        "exists": true,
+        "size_bytes": null,
+        "sha256": null
+    },
+    "input_t2": {
+        "path": "D:\\Volador Tasks\\Day_5\\Volador-wetland-and-vegetation\\backend\\Engine_module\\data\\sample_scene\\t2",
+        "exists": true,
+        "size_bytes": null,
+        "sha256": null
+    },
+    "t1_date": "2023-08-14",
+    "t2_date": "2023-08-28",
+    "crs": "EPSG:32633",
+    "resolution": [
+        10.0,
+        10.0
+    ],
+    "dimensions": [
+        100,
+        100
+    ],
+    "total_runtime_seconds": 62.17556190001778
+}

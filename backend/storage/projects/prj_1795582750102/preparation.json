@@ -1,0 +1,46 @@
+{
+  "project_id": "prj_1795582750102",
+  "status": "COMMITTED",
+  "is_locked": true,
+  "committed_at": "2026-11-28T04:19:59Z",
+  "updated_at": "2026-11-28T04:19:59Z",
+  "inclusion": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          519.75,
+          816.75
+        ],
+        [
+          614.25,
+          1674
+        ],
+        [
+          1863,
+          1593
+        ],
+        [
+          1795.5,
+          729
+        ],
+        [
+          519.75,
+          816.75
+        ]
+      ]
+    ]
+  },
+  "manual_exclusions": [],
+  "metrics": {
+    "source_pixels": 5038848,
+    "inclusion_pixels": 1093159,
+    "excluded_pixels": 0,
+    "effective_pixels": 1093159,
+    "source_ha": null,
+    "inclusion_ha": null,
+    "excluded_ha": null,
+    "effective_ha": null,
+    "area_basis": "PIXEL_COUNT_ONLY"
+  }
+}

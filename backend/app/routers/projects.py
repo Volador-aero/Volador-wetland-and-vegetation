@@ -70,6 +70,11 @@ def update_project_dates(project_id: str, payload: ProjectDatesUpdate):
             status_code=400,
             detail="T1 date must not be later than T2 date."
         )
+    if t1 == t2:
+        raise HTTPException(
+            status_code=400,
+            detail="T1 and T2 observation dates must be different."
+        )
 
     ProjectStore.update_project(project_id, {
         "t1_date": payload.t1_date,
@@ -82,7 +87,13 @@ def update_project_dates(project_id: str, payload: ProjectDatesUpdate):
 
 @router.post("/{project_id}/reset", response_model=Project)
 def reset_project(project_id: str):
-    project = ProjectStore.reset_project(project_id)
+    try:
+        project = ProjectStore.reset_project(project_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
 
     if not project:
         raise HTTPException(
@@ -94,7 +105,13 @@ def reset_project(project_id: str):
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_project(project_id: str):
-    success = ProjectStore.delete_project(project_id)
+    try:
+        success = ProjectStore.delete_project(project_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     if not success:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
     return None
@@ -130,7 +147,7 @@ def update_project_preparation(project_id: str, payload: PreparationUpdateReques
 
     clean_exclusions = []
     for exc in payload.manual_exclusions:
-        exc_dict = exc.dict() if hasattr(exc, "dict") else exc
+        exc_dict = exc.model_dump() if hasattr(exc, "model_dump") else exc
         if not exc_dict.get("comment", "").strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

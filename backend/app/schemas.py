@@ -10,13 +10,30 @@ from pydantic import BaseModel, Field
 
 # --- Projects ---
 class ProjectCreate(BaseModel):
-    name: str = Field(..., example="Wetland Degradation Assessment")
-    description: Optional[str] = Field(None, example="Sentinel-2 temporal analysis")
-    aoi_name: Optional[str] = Field("Central Reserve", example="Central Reserve")
-    analysis_mode: Optional[str] = Field("wetland", example="wetland")
-    t1_date: Optional[str] = Field(None, example="2023-08-14")
-    t2_date: Optional[str] = Field(None, example="2023-08-14")
-
+    name: str = Field(
+        ...,
+        json_schema_extra={"example": "Wetland Degradation Assessment"},
+    )
+    description: Optional[str] = Field(
+        None,
+        json_schema_extra={"example": "Sentinel-2 temporal analysis"},
+    )
+    aoi_name: Optional[str] = Field(
+        "Central Reserve",
+        json_schema_extra={"example": "Central Reserve"},
+    )
+    analysis_mode: Optional[str] = Field(
+        "wetland",
+        json_schema_extra={"example": "wetland"},
+    )
+    t1_date: Optional[str] = Field(
+        None,
+        json_schema_extra={"example": "2023-08-14"},
+    )
+    t2_date: Optional[str] = Field(
+        None,
+        json_schema_extra={"example": "2023-08-14"},
+    )
 
 class Project(BaseModel):
     id: str
@@ -165,6 +182,22 @@ class RunStatusResponse(BaseModel):
     completed_at: Optional[str] = None
     message: Optional[str] = None
     error: Optional[str] = None
+
+
+class ReadinessCheck(BaseModel):
+    id: str
+    label: str
+    status: Literal["PASS", "WARNING", "BLOCKED"]
+    message: str
+    blocking: bool
+
+
+class AnalysisReadinessResponse(BaseModel):
+    project_id: str
+    analysis_mode: Literal["vegetation", "wetland"]
+    ready: bool
+    status: Literal["READY", "WARNING", "BLOCKED"]
+    checks: List[ReadinessCheck]
 
 
 # --- Layer ---

@@ -78,6 +78,22 @@ export interface ValidationResult {
   dates_required?: boolean;
 }
 
+export interface ReadinessCheck {
+  id: string;
+  label: string;
+  status: "PASS" | "WARNING" | "BLOCKED";
+  message: string;
+  blocking: boolean;
+}
+
+export interface AnalysisReadiness {
+  project_id: string;
+  analysis_mode: "vegetation" | "wetland";
+  ready: boolean;
+  status: "READY" | "WARNING" | "BLOCKED";
+  checks: ReadinessCheck[];
+}
+
 export interface RunStatus {
   run_id: string;
   project_id: string;
@@ -396,6 +412,18 @@ export async function launchRun(projectId: string, config?: Record<string, any>)
     body: JSON.stringify({ project_id: projectId, config }),
   });
   if (!res.ok) await handleResponseError(res, "Failed to launch analysis run");
+  return res.json();
+}
+
+export async function getAnalysisReadiness(
+  projectId: string,
+  analysisMode: "vegetation" | "wetland",
+  useObservationDates: boolean = true
+): Promise<AnalysisReadiness> {
+  const res = await fetch(
+    `${API_BASE}/runs/readiness/${encodeURIComponent(projectId)}?analysis_mode=${analysisMode}&use_observation_dates=${useObservationDates}`
+  );
+  if (!res.ok) await handleResponseError(res, "Failed to load analysis readiness");
   return res.json();
 }
 

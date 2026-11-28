@@ -33,6 +33,7 @@ export interface ProjectContextType {
   clearAll: () => Promise<void>;
   setActiveLayerId: (id: string) => void;
   triggerValidation: (mode?: "vegetation" | "wetland") => Promise<void>;
+  updateDates: (t1Date: string, t2Date: string) => Promise<void>;
   uploadBand: (
     timePoint: "t1" | "t2",
     band: "green" | "red" | "rededge" | "nir" | "boundary",

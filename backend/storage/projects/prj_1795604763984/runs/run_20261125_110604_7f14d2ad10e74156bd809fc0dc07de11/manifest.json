@@ -1,0 +1,379 @@
+{
+    "run_id": "run_20261125_110604_7f14d2ad10e74156bd809fc0dc07de11",
+    "generated_utc": "2026-11-25T11:06:39.552606+00:00",
+    "total_outputs": 62,
+    "outputs": [
+        {
+            "path": "alignment/t1_aligned/green.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/t1_aligned/red.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/t1_aligned/rededge.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/t1_aligned/nir.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/t2_aligned/green.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/t2_aligned/red.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/t2_aligned/rededge.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/t2_aligned/nir.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/overlap_mask.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "exclusions/inclusion_mask.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "exclusions/manual_exclusion_mask.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "alignment/effective_analysis_mask.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "vegetation/t1_health.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "vegetation/t2_health.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "vegetation/T1/confidence.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "vegetation/T2/confidence.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "vegetation/overlap_mask.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "vegetation/pair_metadata.json",
+            "type": "JSON",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "change/transition_map.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "change/delta_ndvi.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "change/delta_gndvi.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "change/delta_ndre.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "change/cva_magnitude.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "degradation/degradation_map.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "degradation/recovery_map.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "degradation/residual_stress.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "degradation/canopy_loss_map.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "wetland/wetland_mask.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "hydrology/ndwi_t1.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "hydrology/ndwi_t2.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "hydrology/delta_ndwi.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "hydrology/water_mask_t1.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "hydrology/water_mask_t2.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "hydrology/water_change.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "metrics/fusion_metrics.json",
+            "type": "JSON",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "metrics/evidence_matrix.csv",
+            "type": "CSV",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "fusion/evidence_fusion.tif",
+            "type": "GeoTIFF",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "metrics/metrics.json",
+            "type": "JSON",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "metrics/transition_matrix.csv",
+            "type": "CSV",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "metrics/water_metrics.json",
+            "type": "JSON",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "validation/qa_report.json",
+            "type": "JSON",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "analysis_result.json",
+            "type": "JSON",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/analysis_report.md",
+            "type": "Markdown",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/source_t1.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/source_t2.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/manual_exclusions.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/effective_analysis.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/health_t1.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/health_t2.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/transition.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/degradation.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/recovery.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/canopy_loss.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/cva_magnitude.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/delta_ndvi.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/delta_gndvi.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/delta_ndre.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/ndwi_t1.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/ndwi_t2.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "reports/figures/water_change.png",
+            "type": "PNG",
+            "size_bytes": 1040258,
+            "sha256": "939bb37287130051b8d0f8fcbab32c11ddb46941bf3731f9824ec81d229ecde3"
+        },
+        {
+            "path": "reports/figures/evidence_fusion.png",
+            "type": "PNG",
+            "size_bytes": null,
+            "sha256": null
+        },
+        {
+            "path": "metadata.json",
+            "type": "JSON",
+            "size_bytes": 1659,
+            "sha256": "bfd419df33bd47bbdb08ecbad366484374e06a65143dd5a684eefcc628d04bc5"
+        }
+    ]
+}

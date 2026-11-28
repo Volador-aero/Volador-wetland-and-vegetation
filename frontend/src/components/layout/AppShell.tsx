@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Sidebar from "./Sidebar";
 import TopBar from "./TopBar";
 import MapViewport from "../maps/MapViewport";
@@ -11,12 +11,12 @@ import ReportPage from "../../features/report/ReportPage";
 import PrepareAreaPage from "../../features/preparation/PrepareAreaPage";
 import { useProject } from "../../context/useProject";
 import type { DatasetValidationState } from "@/types/dataset";
-import { updateProjectDates } from "../../api/client";
 
 type AnalysisMode = "vegetation" | "wetland";
 
 export default function AppShell() {
   const [activeItem, setActiveItem] = useState("Overview");
+  const workspaceRef = useRef<HTMLDivElement>(null);
   // analysisMode is lifted here so both the Dataset page and the Analysis
   // page share the same mode without needing an extra context value.
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("wetland");
@@ -25,6 +25,7 @@ export default function AppShell() {
     project,
     validation,
     triggerValidation,
+    updateDates,
     uploadBand,
     results,
     runStatus,
@@ -37,6 +38,12 @@ export default function AppShell() {
   const [t2DateInput, setT2DateInput] = useState("");
   const [savingDates, setSavingDates] = useState(false);
   const [dateSaveError, setDateSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (error) {
+      workspaceRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }, [error]);
 
   useEffect(() => {
     // Only prompt for dates in wetland (temporal) mode
@@ -65,6 +72,13 @@ export default function AppShell() {
     }
   };
 
+  const openDateEditor = () => {
+    setT1DateInput(project?.t1_date ?? "");
+    setT2DateInput(project?.t2_date ?? "");
+    setDateSaveError(null);
+    setShowDateModal(true);
+  };
+
   useEffect(() => {
     if (project?.id) {
       triggerValidation(analysisMode);
@@ -83,12 +97,16 @@ export default function AppShell() {
       setDateSaveError("T1 date must not be later than T2 date.");
       return;
     }
+    if (t1DateInput === t2DateInput) {
+      setDateSaveError("T1 and T2 observation dates must be different.");
+      return;
+    }
 
     try {
       setSavingDates(true);
       setDateSaveError(null);
 
-      await updateProjectDates(project.id, t1DateInput, t2DateInput);
+      await updateDates(t1DateInput, t2DateInput);
 
       setShowDateModal(false);
       await triggerValidation(analysisMode);
@@ -444,14 +462,26 @@ export default function AppShell() {
                 </div>
               </div>
 
-              <button
-                type="button"
-                disabled={loading}
-                onClick={() => triggerValidation(analysisMode)}
-                className="rounded-md bg-[var(--accent)] px-4 py-2.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-              >
-                {loading ? "VALIDATING..." : "Validate Datasets"}
-              </button>
+              <div className="flex gap-2">
+                {analysisMode === "wetland" && project?.t1_date && project?.t2_date && (
+                  <button
+                    type="button"
+                    disabled={loading}
+                    onClick={openDateEditor}
+                    className="rounded-md border border-[var(--border)] px-4 py-2.5 text-xs font-medium text-[var(--text)] hover:bg-[var(--background)] disabled:opacity-50"
+                  >
+                    Edit Observation Dates
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={() => triggerValidation(analysisMode)}
+                  className="rounded-md bg-[var(--accent)] px-4 py-2.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+                >
+                  {loading ? "VALIDATING..." : "Validate Datasets"}
+                </button>
+              </div>
             </div>
 
             {validation && (
@@ -496,12 +526,15 @@ export default function AppShell() {
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
               <div className="w-full max-w-md rounded-lg border border-[var(--border)] bg-[var(--surface)] p-6 shadow-2xl">
                 <div className="text-lg font-semibold text-[var(--text)]">
-                  Observation Dates Required
+                  {project?.t1_date && project?.t2_date
+                    ? "Edit Observation Dates"
+                    : "Observation Dates Required"}
                 </div>
 
                 <div className="mt-2 text-sm text-[var(--text-secondary)]">
-                  The acquisition dates could not be detected automatically from the uploaded
-                  datasets. Enter the observation date for each scene.
+                  {project?.t1_date && project?.t2_date
+                    ? "Update the acquisition date for each scene without re-uploading the datasets."
+                    : "The acquisition dates could not be detected automatically from the uploaded datasets. Enter the observation date for each scene."}
                 </div>
 
                 <div className="mt-5 space-y-4">
@@ -584,7 +617,10 @@ export default function AppShell() {
       <main className="flex min-w-0 flex-1 flex-col">
         <TopBar activeItem={activeItem} />
 
-        <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-auto p-7">
+        <div
+          ref={workspaceRef}
+          className="flex min-h-0 flex-1 flex-col gap-5 overflow-auto p-7"
+        >
           {error && (
             <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
               {error}
