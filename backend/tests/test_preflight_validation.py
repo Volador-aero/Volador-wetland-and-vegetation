@@ -172,6 +172,39 @@ def test_valid_sample_fallback_completes_without_run_state(valid_preflight):
     assert not services.RUN_STATES
 
 
+def test_partial_wetland_upload_does_not_use_sample_fallback(valid_preflight, monkeypatch, tmp_path):
+    t1_dir = Path(valid_preflight["t1_dir"])
+    t1_dir.mkdir()
+    (t1_dir / "scene_G.tif").write_bytes(b"test")
+
+    with pytest.raises(ValueError, match="requires both T1 and T2"):
+        services.RunWorker.preflight_run(valid_preflight["id"])
+
+
+def test_malformed_model_config_is_rejected_as_value_error(valid_preflight, monkeypatch):
+    monkeypatch.setattr(services, "load_config", lambda _: {"model": {}})
+
+    with pytest.raises(ValueError, match="model path is missing"):
+        services.RunWorker.preflight_run(valid_preflight["id"])
+
+
+def test_reset_project_is_blocked_for_active_run(valid_preflight, monkeypatch, tmp_path):
+    project = valid_preflight
+    services.RUN_STATES["active-run"] = {
+        "run_id": "active-run",
+        "project_id": project["id"],
+        "status": "VALIDATING",
+    }
+    monkeypatch.setattr(
+        services.ProjectStore,
+        "load_projects",
+        lambda: {project["id"]: project},
+    )
+
+    with pytest.raises(ValueError, match="cannot be reset"):
+        services.ProjectStore.reset_project(project["id"])
+
+
 def test_readiness_reports_blocked_equal_dates(valid_preflight, monkeypatch):
     project = valid_preflight
     project["t1_date"] = "2023-08-14"

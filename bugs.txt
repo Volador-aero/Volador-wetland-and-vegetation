@@ -1,0 +1,22 @@
+Bugs fixed
+Invalid date order could pass preflight
+
+Preflight now rejects a T1 date later than T2, rather than allowing the run to fail later in the pipeline.
+Added a regression test.
+Analysis mode aliases could disagree
+
+Requests containing both analysisMode and analysis_mode could be interpreted differently by the router, preflight, and worker.
+Standardized the precedence to analysisMode → analysis_mode → project mode → wetland.
+Added a regression test.
+Run IDs could collide
+
+IDs previously used timestamps with only second-level precision.
+Added a UUID suffix so runs started in the same second get distinct IDs and output directories.
+Added a regression test.
+Malformed ONNX outputs could reach argmax
+
+Inference now validates output presence, rank, batch/class/spatial dimensions, numeric values, and finite values before class-map generation.
+Added focused ONNX wrapper tests.
+Tests could leak global run state
+
+Added an autouse fixture in the preflight tests to clear services.RUN_STATES before and after each test.

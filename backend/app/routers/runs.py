@@ -44,7 +44,7 @@ def launch_run(payload: RunCreateRequest):
     elif project.get("analysis_mode"):
         effective_mode = project["analysis_mode"].strip().lower()
 
-    config_dict = payload.config.dict() if payload.config else None
+    config_dict = payload.config.model_dump() if payload.config else None
 
     try:
         RunWorker.preflight_run(payload.project_id, config_dict)
@@ -61,7 +61,7 @@ def launch_run(payload: RunCreateRequest):
 
     print(
         "[GIS DEBUG] backend config dict:",
-        payload.config.dict() if payload.config else None,
+        payload.config.model_dump() if payload.config else None,
     )
     try:
         run_info = RunWorker.start_run(payload.project_id, config_dict)

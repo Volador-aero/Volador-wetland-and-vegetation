@@ -1,75 +1,106 @@
-# React + TypeScript + Vite
+# GIS Wetland and Vegetation Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React 19, TypeScript, and Vite frontend for the GIS Wetland Degradation &
+Depletion Engine.
 
-Currently, two official plugins are available:
+## Prerequisites
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Node.js 20 or later
+- npm
+- The backend API running on `http://127.0.0.1:8000`
 
-## React Compiler
+## Usage
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Install dependencies:
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```bash
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Start the development server:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```bash
+npm run dev
 ```
+
+Open `http://localhost:5173`.
+
+Create a production build:
+
+```bash
+npm run build
+```
+
+Run the test suite:
+
+```bash
+npm test
+```
+
+Run lint checks:
+
+```bash
+npm run lint
+```
+
+## Application workflow
+
+1. Create or select a project.
+2. Upload T1 Green, Red, RedEdge, and NIR GeoTIFF bands.
+3. For wetland mode, upload the T2 band set and set T1/T2 observation dates.
+4. Prepare and lock the analysis area.
+5. Review the Analysis Readiness Checklist:
+   - **PASS** means the prerequisite is satisfied.
+   - **WARNING** means the run can continue with limited evidence.
+   - **BLOCKED** means the prerequisite must be corrected before launching.
+6. Run vegetation or wetland analysis.
+7. Review maps and metrics on the Results and Validation pages.
+8. Download or preview the generated report.
+
+The frontend is configured to call `/api` through the backend. If the API URL
+changes, update the API client configuration in
+`src/api/client.ts`.
+
+## Observation dates
+
+Use **Edit Observation Dates** in the application shell to update T1 and T2
+after uploading datasets.
+
+When observation-date validation is enabled, wetland runs require:
+
+- both dates in `YYYY-MM-DD` format;
+- T1 earlier than T2;
+- no equal dates.
+
+Disabling the observation-date setting omits this validation. Run preflight
+and readiness still enforce all remaining model, dataset, spatial, and
+preparation requirements.
+
+## Key directories
+
+- `src/api/` - typed backend API client.
+- `src/context/` - project and workflow state.
+- `src/features/analysis/` - analysis configuration, run progress, and
+  readiness checklist.
+- `src/features/preparation/` - analysis-area preparation.
+- `src/features/results/` - result maps and metrics.
+- `src/features/validation/` - QA and validation displays.
+- `src/features/report/` - report preview and downloads.
+- `src/components/maps/` - OpenLayers map components.
+
+## Changelog
+
+### Unreleased
+
+- Replaced the default Vite template README with project-specific setup and
+  usage documentation.
+- Added the Analysis Readiness Checklist for PASS, WARNING, and BLOCKED states.
+- Added run-button readiness gating.
+- Added automatic readiness refresh after project, dataset, date,
+  preparation, and analysis-mode changes.
+- Added editable observation-date support and `use_observation_dates`
+  handling.
+- Added user-facing launch and preflight error visibility.
+
+For complete project documentation, see the root
+[README](../README.md) and [project documentation](../docs/PROJECT_DOCUMENTATION.md).

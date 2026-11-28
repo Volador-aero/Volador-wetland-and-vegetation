@@ -19,8 +19,8 @@ import re
 @router.post("/upload")
 def upload_dataset_band(
     project_id: str,
-    time_point: str = Form(..., example="t1"),  # t1 or t2
-    band: str = Form(..., example="green"),     # green, red, rededge, nir, boundary
+    time_point: str = Form(..., examples=["t1"]),  # t1 or t2
+    band: str = Form(..., examples=["green"]),     # green, red, rededge, nir, boundary
     file: UploadFile = File(...)
 ):
     project = ProjectStore.get_project(project_id)

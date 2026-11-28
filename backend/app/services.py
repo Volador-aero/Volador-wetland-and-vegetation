@@ -12,7 +12,7 @@ import logging
 import io
 import time
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 from concurrent.futures import ThreadPoolExecutor
@@ -49,7 +49,7 @@ RUN_STATES: Dict[str, Dict[str, Any]] = {}
 
 
 def now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _extract_date_from_directory(directory: Path) -> Optional[str]:
@@ -147,6 +147,17 @@ class ProjectStore:
         return projects.get(project_id)
 
     @classmethod
+    def get_active_run(cls, project_id: str) -> Optional[Dict[str, Any]]:
+        terminal_statuses = {"COMPLETED", "FAILED"}
+        for run_info in RUN_STATES.values():
+            if (
+                run_info.get("project_id") == project_id
+                and run_info.get("status") not in terminal_statuses
+            ):
+                return run_info
+        return None
+
+    @classmethod
     def delete_project(cls, project_id: str) -> bool:
         projects = cls.load_projects()
         if project_id in projects:
@@ -155,6 +166,12 @@ class ProjectStore:
             proj_dir = STORAGE_DIR / "projects" / project_id
             if proj_dir.exists():
                 shutil.rmtree(proj_dir, ignore_errors=True)
+            for run_id in [
+                run_id
+                for run_id, run_info in RUN_STATES.items()
+                if run_info.get("project_id") == project_id
+            ]:
+                RUN_STATES.pop(run_id, None)
             return True
         return False
 
@@ -174,6 +191,12 @@ class ProjectStore:
             return None
 
         project = projects[project_id]
+        active_run = cls.get_active_run(project_id)
+        if active_run:
+            raise ValueError(
+                f"Project cannot be reset while run {active_run['run_id']} "
+                "is active."
+            )
 
         # --------------------------------------------------------
         # Clear uploaded T1/T2 datasets
@@ -614,15 +637,19 @@ class RunWorker:
         user_has_t1 = t1_dir.exists() and bool(list(t1_dir.glob("*.tif")) or list(t1_dir.glob("*.TIF")))
         user_has_t2 = t2_dir.exists() and bool(list(t2_dir.glob("*.tif")) or list(t2_dir.glob("*.TIF")))
 
-        if user_has_t1 or (sample_dir / "t1").exists():
+        if user_has_t1:
             add("t1_dataset", "T1 dataset available", "PASS", "T1 raster bands are available.")
+        elif (not user_has_t1 and not user_has_t2) and (sample_dir / "t1").exists():
+            add("t1_dataset", "T1 dataset available", "PASS", "The sample T1 raster bands are available.")
         else:
             add("t1_dataset", "T1 dataset available", "BLOCKED", "Upload the T1 Green, Red, RedEdge, and NIR bands.")
 
         if is_vegetation:
             add("t2_dataset", "T2 dataset", "PASS", "T2 is not required in vegetation-only mode.")
-        elif user_has_t2 or (sample_dir / "t2").exists():
+        elif user_has_t2:
             add("t2_dataset", "T2 dataset available", "PASS", "T2 raster bands are available.")
+        elif (not user_has_t1 and not user_has_t2) and (sample_dir / "t2").exists():
+            add("t2_dataset", "T2 dataset available", "PASS", "The sample T2 raster bands are available.")
         else:
             add("t2_dataset", "T2 dataset available", "BLOCKED", "Upload the T2 Green, Red, RedEdge, and NIR bands.")
 
@@ -632,12 +659,12 @@ class RunWorker:
         elif user_has_t1 and user_has_t2:
             selected_t1 = t1_dir
             selected_t2 = t2_dir
-        elif (sample_dir / "t1").exists() and (sample_dir / "t2").exists():
+        elif not user_has_t1 and not user_has_t2 and (sample_dir / "t1").exists() and (sample_dir / "t2").exists():
             selected_t1 = sample_dir / "t1"
             selected_t2 = sample_dir / "t2"
         else:
-            selected_t1 = t1_dir if user_has_t1 else sample_dir / "t1"
-            selected_t2 = t2_dir if user_has_t2 else sample_dir / "t2"
+            selected_t1 = t1_dir
+            selected_t2 = t2_dir
         band_mapping = {
             "green": ["*_G.tif", "*_G.TIF", "*green.tif"],
             "red": ["*_R.tif", "*_R.TIF", "*red.tif"],
@@ -732,35 +759,44 @@ class RunWorker:
         try:
             config_path = ENGINE_SRC.parent / "configs" / "config.json"
             config = load_config(config_path)
-            model_config = config["model"]
-            model_ok = (
-                model_config.get("in_channels") == 5
-                and model_config.get("num_classes") == 4
-                and model_config.get("channel_order") == ["ndvi", "gndvi", "ndre", "nir", "rededge"]
-            )
-            if not model_ok:
-                add("model_compatibility", "Approved model ready", "BLOCKED", "The configured model is incompatible. Install the approved 5-channel, 4-class model.")
-            else:
-                model_path = Path(model_config["path"])
-                if not model_path.is_absolute():
-                    model_path = ENGINE_SRC.parent / model_path
-                if not model_path.is_file():
-                    add("model_compatibility", "Approved model ready", "BLOCKED", "The configured analysis model is missing.")
+            model_config = config.get("model") if isinstance(config, dict) else None
+            if not isinstance(model_config, dict):
+                add("model_compatibility", "Approved model ready", "BLOCKED", "The analysis model configuration is missing.")
+                model_config = None
+            if model_config is not None:
+                model_path_value = model_config.get("path")
+                if not isinstance(model_path_value, str) or not model_path_value.strip():
+                    add("model_compatibility", "Approved model ready", "BLOCKED", "The configured model path is missing.")
+                    model_config = None
+            if model_config is not None:
+                model_ok = (
+                    model_config.get("in_channels") == 5
+                    and model_config.get("num_classes") == 4
+                    and model_config.get("channel_order") == ["ndvi", "gndvi", "ndre", "nir", "rededge"]
+                )
+                if not model_ok:
+                    add("model_compatibility", "Approved model ready", "BLOCKED", "The configured model is incompatible. Install the approved 5-channel, 4-class model.")
                 else:
-                    try:
-                        model = ONNXModelWrapper(str(model_path))
-                        if model.session is None:
-                            raise RuntimeError("ONNX session unavailable")
-                        input_shape = model.session.get_inputs()[0].shape
-                        output_shape = model.session.get_outputs()[0].shape
-                        input_ok = len(input_shape) >= 2 and input_shape[1] == 5
-                        output_ok = len(output_shape) >= 2 and output_shape[1] == 4
-                        if input_ok and output_ok:
-                            add("model_compatibility", "Approved model ready", "PASS", "The model supports 5 input channels and 4 output classes.")
-                        else:
-                            add("model_compatibility", "Approved model ready", "BLOCKED", "The model is incompatible. Install the approved 5-channel, 4-class model.")
-                    except Exception:
-                        add("model_compatibility", "Approved model ready", "BLOCKED", "The configured model could not be loaded. Reinstall or restore the approved model.")
+                    model_path = Path(model_path_value)
+                    if not model_path.is_absolute():
+                        model_path = ENGINE_SRC.parent / model_path
+                    if not model_path.is_file():
+                        add("model_compatibility", "Approved model ready", "BLOCKED", "The configured analysis model is missing.")
+                    else:
+                        try:
+                            model = ONNXModelWrapper(str(model_path))
+                            if model.session is None:
+                                raise RuntimeError("ONNX session unavailable")
+                            input_shape = model.session.get_inputs()[0].shape
+                            output_shape = model.session.get_outputs()[0].shape
+                            input_ok = len(input_shape) >= 2 and input_shape[1] == 5
+                            output_ok = len(output_shape) >= 2 and output_shape[1] == 4
+                            if input_ok and output_ok:
+                                add("model_compatibility", "Approved model ready", "PASS", "The model supports 5 input channels and 4 output classes.")
+                            else:
+                                add("model_compatibility", "Approved model ready", "BLOCKED", "The model is incompatible. Install the approved 5-channel, 4-class model.")
+                        except Exception:
+                            add("model_compatibility", "Approved model ready", "BLOCKED", "The configured model could not be loaded. Reinstall or restore the approved model.")
         except Exception:
             add("model_compatibility", "Approved model ready", "BLOCKED", "The analysis model configuration could not be read.")
 
@@ -829,7 +865,18 @@ class RunWorker:
                 f"Analysis cannot start: Invalid analysis configuration. {exc}"
             ) from exc
 
-        model_config = config["model"]
+        model_config = config.get("model") if isinstance(config, dict) else None
+        if not isinstance(model_config, dict):
+            raise ValueError(
+                "Analysis cannot start: Invalid analysis configuration. "
+                "The model configuration is missing."
+            )
+        model_path_value = model_config.get("path")
+        if not isinstance(model_path_value, str) or not model_path_value.strip():
+            raise ValueError(
+                "Analysis cannot start: Invalid analysis configuration. "
+                "The model path is missing."
+            )
         if model_config.get("in_channels") != 5:
             raise ValueError(
                 "Analysis cannot start: Configuration model.in_channels "
@@ -852,10 +899,10 @@ class RunWorker:
                 "must define ndvi, gndvi, ndre, nir, rededge."
             )
 
-        model_path = Path(model_config["path"])
+        model_path = Path(model_path_value)
         if not model_path.is_absolute():
             model_path = ENGINE_SRC.parent / model_path
-        display_model_path = Path(model_config["path"])
+        display_model_path = Path(model_path_value)
         if display_model_path.is_absolute():
             try:
                 display_model_path = display_model_path.relative_to(ENGINE_SRC.parent)
@@ -932,11 +979,22 @@ class RunWorker:
                     )
                 t1_dir = sample_dir / "t1"
         elif not (user_has_t1 and user_has_t2):
-            if not sample_dir.exists():
+            has_any_user_dataset = user_has_t1 or user_has_t2
+            sample_pair_available = (
+                (sample_dir / "t1").exists()
+                and (sample_dir / "t2").exists()
+            )
+            if has_any_user_dataset:
+                raise ValueError(
+                    "Analysis cannot start: Wetland analysis requires both "
+                    "T1 and T2 dataset uploads. Upload the missing dataset "
+                    "before starting the run."
+                )
+            if not sample_pair_available:
                 raise ValueError(
                     "Analysis cannot start: Required T1/T2 dataset files "
                     f"were not found in {t1_dir} and {t2_dir}, and no "
-                    "sample scene is available."
+                    "complete sample scene pair is available."
                 )
             t1_dir = sample_dir / "t1"
             t2_dir = sample_dir / "t2"
@@ -1043,7 +1101,7 @@ class RunWorker:
             ProjectStore.save_preparation(project_id, prep)
             ProjectStore.update_project(project_id, {"preparation_status": "COMMITTED", "is_locked": True, "status": "PREPARATION_COMMITTED"})
 
-        run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
+        run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
         runs_dir = STORAGE_DIR / "projects" / project_id / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
         run_output_dir = runs_dir / run_id
@@ -1070,7 +1128,10 @@ class RunWorker:
 
     @classmethod
     def _execute_pipeline(cls, run_id: str, project: Dict[str, Any], output_dir: Path, config_overrides: Optional[Dict[str, Any]]):
-        run_info = RUN_STATES[run_id]
+        run_info = RUN_STATES.get(run_id)
+        if run_info is None:
+            logger.warning("Skipping execution for removed run %s", run_id)
+            return
         run_info["started_at"] = now_iso()
         run_info["status"] = "VALIDATING"
         run_info["progress"] = 10
@@ -1101,13 +1162,13 @@ class RunWorker:
                         base_cfg.setdefault("water", {})["ndwi_threshold"] = config_overrides["ndwi_threshold"]
                     if config_overrides.get("manual_exclusions"):
                         raw_excl = config_overrides["manual_exclusions"]
-                        clean_excl = [e.dict() if hasattr(e, "dict") else e for e in raw_excl] if raw_excl else []
+                        clean_excl = [e.model_dump() if hasattr(e, "model_dump") else e.dict() if hasattr(e, "dict") else e for e in raw_excl] if raw_excl else []
                         base_cfg["manual_exclusions"] = clean_excl
                     else:
                         prep = ProjectStore.load_preparation(project["id"])
                         if prep and prep.get("manual_exclusions"):
                             raw_excl = prep.get("manual_exclusions")
-                            clean_excl = [e.dict() if hasattr(e, "dict") else e for e in raw_excl] if raw_excl else []
+                            clean_excl = [e.model_dump() if hasattr(e, "model_dump") else e.dict() if hasattr(e, "dict") else e for e in raw_excl] if raw_excl else []
                             base_cfg["manual_exclusions"] = clean_excl
 
                     if config_overrides.get("inclusion_geometry"):
@@ -1161,7 +1222,18 @@ class RunWorker:
             else:
                 # Wetland mode — both T1 and T2 are needed
                 if not (user_has_t1 and user_has_t2):
-                    if sample_dir.exists():
+                    has_any_user_dataset = user_has_t1 or user_has_t2
+                    sample_pair_available = (
+                        (sample_dir / "t1").exists()
+                        and (sample_dir / "t2").exists()
+                    )
+                    if has_any_user_dataset:
+                        raise FileNotFoundError(
+                            "Wetland analysis requires both T1 and T2 dataset "
+                            "uploads. The missing dataset must be uploaded "
+                            "before starting the run."
+                        )
+                    if sample_pair_available:
                         t1_dir = sample_dir / "t1"
                         t2_dir = sample_dir / "t2"
                         if not wetland_boundary:
