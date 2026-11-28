@@ -153,7 +153,7 @@ def _transform_pixel_coords_to_grid(coords: Any, height: float, transform: Any) 
         x, y = float(coords[0]), float(coords[1])
         y_flipped = height - y
         if transform is not None:
-            tx, ty = transform * (x, y_flipped)
+            tx, ty = transform @ (x, y_flipped)
             return [tx, ty, *coords[2:]]
         return [x, y_flipped, *coords[2:]]
     return [_transform_pixel_coords_to_grid(ring, height, transform) for ring in coords]
